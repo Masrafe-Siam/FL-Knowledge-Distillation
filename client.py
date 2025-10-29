@@ -1,517 +1,495 @@
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+# gRPC stability / payloads
+os.environ.setdefault("GRPC_KEEPALIVE_TIME_MS", "30000")
+os.environ.setdefault("GRPC_KEEPALIVE_TIMEOUT_MS", "10000")
+os.environ.setdefault("GRPC_HTTP2_MAX_PINGS_WITHOUT_DATA", "0")
+os.environ.setdefault("GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS", "1")
+os.environ.setdefault("GRPC_MAX_RECEIVE_MESSAGE_LENGTH", str(200 * 1024 * 1024))
+os.environ.setdefault("GRPC_MAX_SEND_MESSAGE_LENGTH",    str(200 * 1024 * 1024))
+
+import logging, warnings
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
+
+import multiprocessing as mp
+import time
+import argparse
+from typing import Dict, List, Tuple, Optional
+from collections import OrderedDict
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, roc_auc_score
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
-import time
-import os
-from typing import Dict, List, Tuple, Optional
-import logging
-from collections import defaultdict
-import json
+import flwr as fl
+import grpc
+import cv2
 
-logging.basicConfig(level=logging.INFO)
+from utils.label_focalLoss import FocalLoss, LabelSmoothingLoss
+from utils.dataloder import create_data_loaders, get_class_weights  # (spelling kept)
+from utils.evaluation import ModelTrainer, ModelMetrics
+from models.modelEngine import get_model
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
-class EarlyStopping:
-    """Early stopping to prevent overfitting"""
-    def __init__(self, patience: int = 5, min_delta: float = 0.001, mode: str = 'min'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
+RESULTS_BASE_DIR = os.path.abspath(os.path.join("Result", "clientresult"))
+os.makedirs(RESULTS_BASE_DIR, exist_ok=True)
 
-    def __call__(self, score: float) -> bool:
-        if self.best_score is None: 
-            self.best_score = score
-        elif self.mode == 'min':
-            if score < self.best_score - self.min_delta:
-                self.best_score = score
-                self.counter = 0
-            else:
-                self.counter += 1
-        else:
-            if score > self.best_score + self.min_delta:
-                self.best_score = score
-                self.counter = 0
-            else:
-                self.counter += 1
+def _set_runtime_knobs(num_threads: int = 4) -> None:
+    """
+    Configure CPU threads to reduce contention on CPU-only boxes.
+    """
+    os.environ.setdefault("OMP_NUM_THREADS", str(num_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+    try:
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
-        if self.counter >= self.patience:
-            self.early_stop = True  
-        return self.early_stop
-        
-class ModelMetrics: 
-    """Class to compute and store model metrics"""
-    def __init__(self, num_classes: int = 3):
-        self.num_classes = num_classes
-        self.class_names = ['Bengin cases', 'Malignant cases', 'Normal cases']
+def _normalize01(a: np.ndarray) -> np.ndarray:
+    a = a.astype(np.float32)
+    amin = a.min()
+    a = a - amin
+    amax = a.max() + 1e-12
+    a = a / amax
+    return a
 
-    def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
-                      y_probs: Optional[np.ndarray] = None) -> Dict:
-        """Calculate accuracy, precision, recall, F1 score, and AUC"""
-        accuracy = accuracy_score(y_true, y_pred)
-        precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
-        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
-        precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
-        
-        metrics = {
-            'accuracy': accuracy,
-            'precision_macro': precision_macro,
-            'recall_macro': recall_macro,
-            'f1_macro': f1_macro,
-            'precision_weighted': precision_weighted,
-            'recall_weighted': recall_weighted,
-            'f1_weighted': f1_weighted
-        }
-        # Per-class metrics
-        for i, class_name in enumerate(self.class_names):
-            metrics[f'{class_name.lower()}_precision'] = precision[i] if i < len(precision) else 0.0
-            metrics[f'{class_name.lower()}_recall'] = recall[i] if i < len(recall) else 0.0
-            metrics[f'{class_name.lower()}_f1'] = f1[i] if i < len(f1) else 0.0
-        
-        # Medical-specific metrics
-        if len(np.unique(y_true)) == 3: 
-            cm = confusion_matrix(y_true, y_pred)
-            for i, class_name in enumerate(self.class_names):
-                if i < cm.shape[0]:
-                    tp = cm[i, i]
-                    fn = np.sum(cm[i, :]) - tp
-                    fp = np.sum(cm[:, i]) - tp
-                    tn = np.sum(cm) - (tp + fn + fp) 
+def _find_last_conv(module: nn.Module) -> Optional[nn.Conv2d]:
+    last = None
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            last = m
+    return last
 
-                    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+class _GradCAM:
+    """Minimal, fast Grad-CAM for single-image probe."""
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model = model.eval()
+        self.tl = target_layer
+        self.A = None
+        self.dA = None
+        self.ha = self.tl.register_forward_hook(self._hook_act)
+        self.hg = self.tl.register_full_backward_hook(self._hook_grad)
 
-                    metrics[f'{class_name.lower()}_sensitivity'] = sensitivity  
-                    metrics[f'{class_name.lower()}_specificity'] = specificity
-        
-        # AUC-ROC if probabilities are provided
-        if y_probs is not None:
-            try:
-                if self.num_classes == 2:
-                    auc = roc_auc_score(y_true, y_probs[:, 1])
-                    metrics['auc_roc'] = auc
-                else:
-                    auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='macro')
-                    metrics['auc_roc_macro'] = auc
-            except ValueError:
-                logger.warning("Could not calculate AUC-ROC score")
-        
-        return metrics
+    def _hook_act(self, module, inp, out):
+        self.A = out
 
+    def _hook_grad(self, module, gin, gout):
+        self.dA = gout[0]
 
-class ModelTrainer: 
-    """Main Training Engine for the model"""
+    def generate(self, x: torch.Tensor, class_idx: Optional[int] = None) -> np.ndarray:
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        if class_idx is None:
+            class_idx = int(torch.argmax(logits, dim=1).item())
+        score = logits[0, class_idx]
+        score.backward(retain_graph=True)
 
-    def __init__(self, model: nn.Module, device: torch.device, save_dir: str = 'checkpoints', log_dir: str = 'logs'):  # Fixed: was nn.modules
-        self.model = model
-        self.device = device
-        self.save_dir = save_dir
-        self.log_dir = log_dir
+        A = self.A[0]               # [C,H,W]
+        dA = self.dA[0]             # [C,H,W]
+        w = dA.mean(dim=(1, 2))     # [C]
+        cam = torch.relu((w[:, None, None] * A).sum(dim=0)).detach().cpu().numpy()
+        return _normalize01(cam)
 
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(log_dir, exist_ok=True)
+    def close(self):
+        self.ha.remove()
+        self.hg.remove()
 
-        self.metrics_calculator = ModelMetrics() 
-        self.writer = SummaryWriter(log_dir=log_dir)
-        self.history = defaultdict(list)
+def _overlay_on_gray(img_u8: np.ndarray, heat: np.ndarray, alpha: float = 0.35) -> np.ndarray:
+    """img_u8: HxW uint8; heat: HxW [0..1]; returns HxWx3 BGR (OpenCV)."""
+    H, W = img_u8.shape
+    heat_r = cv2.resize(heat, (W, H))
+    heatmap = cv2.applyColorMap((heat_r * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    base = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
+    return cv2.addWeighted(base, 1.0, heatmap, alpha, 0)
 
-    def train_epoch(self, train_loader: DataLoader, optimizer: optim.Optimizer, 
-                   criterion: nn.Module, epoch: int) -> Dict:
-        """Train for one epoch"""
+def _deletion_curve_scores(model: nn.Module, x: torch.Tensor, heat: np.ndarray, steps: int = 10) -> List[float]:
+    """Iteratively zero most-important pixels; record target logit."""
+    device = next(model.parameters()).device
+    x = x.clone().to(device)
+    with torch.no_grad():
+        base_logits = model(x)[0]
+        cls = int(base_logits.argmax().item())
+        scores = [base_logits[cls].item()]
 
-        self.model.train()
-        running_loss = 0.0
-        all_predictions = []
-        all_labels = []
-        all_probabilities = []
-
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1} - Training')
-
-        for batch_idx, (data, target) in enumerate(progress_bar):
-            data, target = data.to(self.device), target.to(self.device)
-
-            optimizer.zero_grad()
-            outputs = self.model(data)  
-            loss = criterion(outputs, target)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            # Statistics
-            running_loss += loss.item()
-            probabilities = torch.softmax(outputs, dim=1)
-            _, predicted = torch.max(outputs.data, 1)
-
-            all_predictions.extend(predicted.cpu().numpy())
-            all_labels.extend(target.cpu().numpy())
-            all_probabilities.extend(probabilities.cpu().detach().numpy())
-
-            # Update progress bar
-            progress_bar.set_postfix({'Loss': loss.item()})
-            
-            # Log to tensorboard
-            global_step = epoch * len(train_loader) + batch_idx
-            self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
-
-        # Calculate epoch metrics - Fixed: was running_loss / (train_loader)
-        avg_loss = running_loss / len(train_loader)
-        metrics = self.metrics_calculator.calculate_metrics( 
-            np.array(all_labels), 
-            np.array(all_predictions), 
-            np.array(all_probabilities)
-        )
-        metrics['loss'] = avg_loss
-        return metrics
-
-    def validate_epoch(self, val_loader: DataLoader, criterion: nn.Module, epoch: int) -> Dict:
-        """Validate for one epoch - This method was missing in your original code"""
-        self.model.eval()
-        
-        running_loss = 0.0
-        all_predictions = []
-        all_labels = []
-        all_probabilities = []
-        
+    H, W = heat.shape
+    order = np.argsort(-heat.flatten()) 
+    k = int(np.ceil(len(order) / steps))
+    for s in range(steps):
+        idxs = order[s * k:(s + 1) * k]
+        for idx in idxs:
+            y, z = idx // W, idx % W
+            x[0, 0, y, z] = 0.0
         with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc=f'Epoch {epoch+1} - Validation')
-            
-            for data, target in progress_bar:
-                data, target = data.to(self.device), target.to(self.device)
-                
-                outputs = self.model(data)
-                loss = criterion(outputs, target)
-                
-                running_loss += loss.item()
-                probabilities = torch.softmax(outputs, dim=1)
-                _, predicted = torch.max(outputs.data, 1)
-                
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(target.cpu().numpy())
-                all_probabilities.extend(probabilities.cpu().detach().numpy())
-                
-                progress_bar.set_postfix({'Loss': loss.item()})
-        
-        # Calculate epoch metrics
-        avg_loss = running_loss / len(val_loader)
-        metrics = self.metrics_calculator.calculate_metrics(
-            np.array(all_labels), 
-            np.array(all_predictions),
-            np.array(all_probabilities)
+            scores.append(model(x)[0, cls].item())
+    return scores
+
+def _auc_trapz(y: List[float]) -> float:
+    y = np.asarray(y, dtype=np.float32)
+    if y.size < 2:
+        return 0.0
+    x = np.linspace(0.0, 1.0, y.size, dtype=np.float32)
+    return float(np.trapezoid(y, x))
+
+
+# Flower Client
+class MedicalFLClient(fl.client.NumPyClient):
+    """
+    Federated Learning client for medical image classification (PyTorch).
+    """
+    def __init__(
+        self,
+        client_id: int,
+        data_dir: str,
+        device: torch.device,
+        model_name: str = "customcnn",
+        num_classes: int = 4,
+        batch_size: int = 16,
+        local_epochs: int = 8,
+        num_workers: int = 4,
+        results_base_dir: str = RESULTS_BASE_DIR,
+    ):
+        self.client_id = client_id
+        self.data_dir = data_dir
+        self.device = device
+        self.num_classes = num_classes
+        self.batch_size = batch_size
+        self.local_epochs = local_epochs
+        self.num_workers = num_workers
+
+        # Per-client folders
+        self.results_base_dir = results_base_dir
+        os.makedirs(self.results_base_dir, exist_ok=True)
+        self.client_root = os.path.join(self.results_base_dir, f"client_{client_id}")
+        self.ckpt_dir = os.path.join(self.client_root, "checkpoints")
+        self.log_dir = os.path.join(self.client_root, "logs")
+        self.xai_dir = os.path.join(self.client_root, "xai")
+        self.pred_dir = os.path.join(self.client_root, "predictions")
+        self.metrics_dir = os.path.join(self.client_root, "metrics")
+        for d in [self.client_root, self.ckpt_dir, self.log_dir, self.xai_dir, self.pred_dir, self.metrics_dir]:
+            os.makedirs(d, exist_ok=True)
+
+        # Model
+        self.model = get_model(model_name, num_classes, pretrained=True)
+        self.model.to(device)
+
+
+        self.target_layer = _find_last_conv(self.model)
+        if self.target_layer is None:
+            logger.warning("No Conv2d layer found for Grad-CAM. XAI probe will be skipped.")
+
+        logger.info(f"Client {client_id}: Loading data from {data_dir}")
+        ctx = mp.get_context("spawn")
+        self.train_loader, self.val_loader, self.test_loader = self._create_loaders_spawn_safe(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            image_size=(224, 224),
+            train_split=0.8,
+            val_split=0.1,
+            test_split=0.1,
+            num_workers=num_workers,
+            multiprocessing_context=ctx,
         )
-        metrics['loss'] = avg_loss
-        
-        return metrics
 
-    def train(self, train_loader: DataLoader, val_loader: DataLoader, 
-          num_epochs: int = 50, learning_rate: float = 0.001,
-          weight_decay: float = 1e-4, class_weights: Optional[torch.Tensor] = None,
-          use_scheduler: bool = True, patience: int = 10,
-          criterion: Optional[nn.Module] = None,
-          optimizer_name: str = 'adamw',
-          scheduler_name: str = 'plateau') -> Dict:
+        # Class weights
+        self.class_weights = get_class_weights(self.train_loader)
+        try:
+            cw_log = self.class_weights.tolist()
+        except Exception:
+            cw_log = self.class_weights
+        logger.info(f"Client {client_id}: Class weights: {cw_log}")
+
+        # Trainer
+        self.trainer = ModelTrainer(self.model, device, self.ckpt_dir, self.log_dir)
+        self.learning_rate = 0.001
+        self.weight_decay = 1e-4
+
+        logger.info(f"Client {client_id} initialized successfully")
+        logger.info(f"  - Training samples:   {len(self.train_loader.dataset)}")
+        logger.info(f"  - Validation samples: {len(self.val_loader.dataset)}")
+        logger.info(f"  - Test samples:       {len(self.test_loader.dataset)}")
+
+    @staticmethod
+    def _create_loaders_spawn_safe(
+        data_dir: str,
+        batch_size: int,
+        image_size: Tuple[int, int],
+        train_split: float,
+        val_split: float,
+        test_split: float,
+        num_workers: int,
+        multiprocessing_context,
+    ):
         """
-        Complete training loop with detailed logging, scheduler, early stopping,
-        and support for external criterion and optimizer config.
+        Try to pass 'multiprocessing_context' to your create_data_loaders if supported.
+        If not, fall back without it (still fine if mp.set_start_method('spawn') is set).
         """
-
-        #Optimizer and Scheduler
-        optimizer = get_optimizer(self.model, optimizer_name, learning_rate, weight_decay)
-
-        if use_scheduler:
-            scheduler = get_scheduler(optimizer, scheduler_name)
-
-        #Loss Function
-        if criterion is None:
-            if class_weights is not None:
-                criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
-            else:
-                criterion = nn.CrossEntropyLoss()
-
-        best_val_loss = float('inf')
-        best_model_state = None
-        early_stopping = EarlyStopping(patience=patience, mode='min')
-
-        logger.info(f"Starting training loop with optimizer={optimizer_name}, scheduler={scheduler_name if use_scheduler else 'None'}")
-
-        total_loss = 0.0
-        total_samples = 0
-        correct_predictions = 0
-
-        for epoch in range(num_epochs):
-            self.model.train()
-            epoch_loss = 0.0
-            epoch_samples = 0
-            epoch_correct = 0
-
-            for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} - Training")):
-                data, target = data.to(self.device), target.to(self.device)
-
-                optimizer.zero_grad()
-                outputs = self.model(data)
-                loss = criterion(outputs, target)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                epoch_samples += data.size(0)
-                _, predicted = torch.max(outputs.data, 1)
-                epoch_correct += (predicted == target).sum().item()
-
-                global_step = epoch * len(train_loader) + batch_idx
-                self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
-
-            avg_epoch_loss = epoch_loss / len(train_loader)
-            epoch_accuracy = epoch_correct / epoch_samples
-
-            #Validation
-            val_metrics = self.validate_epoch(val_loader, criterion, epoch)
-            val_loss = val_metrics['loss']
-
-            #Scheduler Step
-            if use_scheduler:
-                if scheduler_name.lower() == 'plateau':
-                    scheduler.step(val_loss)
-                else:
-                    scheduler.step()
-
-            logger.info(
-                f"Epoch {epoch+1}/{num_epochs} | "
-                f"Train Loss: {avg_epoch_loss:.4f}, Train Acc: {epoch_accuracy:.4f} | "
-                f"Val Loss: {val_loss:.4f}, Val Acc: {val_metrics['accuracy']:.4f} | "
-                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        try:
+            loaders = create_data_loaders(
+                data_dir=data_dir,
+                batch_size=batch_size,
+                train_split=train_split,
+                val_split=val_split,
+                test_split=test_split,
+                image_size=image_size,
+                num_workers=num_workers,
+                multiprocessing_context=multiprocessing_context, 
             )
+            return loaders
+        except TypeError:
+            logger.warning("utils.dataloder.create_data_loaders does not accept 'multiprocessing_context'; "
+                           "falling back without it. Make sure mp.set_start_method('spawn') is set in main().")
+            loaders = create_data_loaders(
+                data_dir=data_dir,
+                batch_size=batch_size,
+                train_split=train_split,
+                val_split=val_split,
+                test_split=test_split,
+                image_size=image_size,
+                num_workers=num_workers,
+            )
+            return loaders
 
-            self._log_epoch_metrics(epoch, {
-                'loss': avg_epoch_loss,
-                'accuracy': epoch_accuracy
-            }, val_metrics)
+    # Flower NumPyClient API ----
+    def get_parameters(self, config: Dict = None) -> List[np.ndarray]:
+        return [p.detach().cpu().numpy() for p in self.model.state_dict().values()]
 
-            self.history['train_loss'].append(avg_epoch_loss)
-            self.history['train_accuracy'].append(epoch_accuracy)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_accuracy'].append(val_metrics['accuracy'])
-            self.history['val_f1_macro'].append(val_metrics['f1_macro'])
+    def set_parameters(self, parameters: List[np.ndarray]) -> None:
+        own_state = self.model.state_dict()
+        keys = list(own_state.keys())
+        incoming = OrderedDict()
+        for k, v in zip(keys, parameters):
+            t = torch.tensor(v, dtype=own_state[k].dtype)
+            incoming[k] = t
+        merged = OrderedDict((k, incoming.get(k, own_state[k])) for k in own_state.keys())
+        self.model.load_state_dict(merged, strict=False)
 
-            #Best Model Checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = self.model.state_dict()
-                self.save_checkpoint(epoch, {'loss': avg_epoch_loss, 'accuracy': epoch_accuracy}, val_metrics, is_best=True)
-            elif early_stopping(val_loss):
-                logger.info(f"Early stopping triggered at epoch {epoch+1}")
+    def fit(self, parameters: List[np.ndarray], config: Dict) -> Tuple[List[np.ndarray], int, Dict]:
+        logger.info(f"Client {self.client_id}: Starting local training round")
+        self.set_parameters(parameters)
+
+        # Server-configurable knobs
+        local_epochs   = int(config.get("local_epochs", self.local_epochs))
+        learning_rate  = float(config.get("learning_rate", self.learning_rate))
+        weight_decay   = float(config.get("weight_decay", self.weight_decay))
+        loss_function  = str(config.get("loss_function", "crossentropy")).lower()
+        optimizer_name = str(config.get("optimizer", "adamw")).lower()
+        scheduler_name = str(config.get("scheduler", "plateau")).lower()
+        use_scheduler  = bool(config.get("use_scheduler", True))
+
+        # Loss
+        if loss_function == "focal":
+            criterion = FocalLoss(alpha=1.0, gamma=2.0)
+        elif loss_function == "label_smoothing":
+            criterion = LabelSmoothingLoss(num_classes=self.num_classes, smoothing=0.1)
+        else:
+            criterion = nn.CrossEntropyLoss(weight=self.class_weights.to(self.device))
+
+        # Train
+        train_history = self.trainer.train(
+            train_loader=self.train_loader,
+            val_loader=self.val_loader,
+            num_epochs=local_epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            class_weights=self.class_weights,
+            use_scheduler=use_scheduler,
+            patience=10,
+            criterion=criterion,
+            optimizer_name=optimizer_name,
+            scheduler_name=scheduler_name,
+        )
+
+        # Evaluate on test
+        test_metrics = self.trainer.evaluate(self.test_loader)
+
+        # XAI probe (optional)
+        xai_metrics = self._xai_probe(self.val_loader, num_samples=16, save_k=3) if self.target_layer else {
+            "xai_del_auc_mean": 0.0, "xai_del_auc_std": 0.0
+        }
+
+        # Save checkpoint
+        best_model_path = os.path.join(self.ckpt_dir, f"client_{self.client_id}_best_model.pth")
+        torch.save(self.model.state_dict(), best_model_path)
+        logger.info(f"Client {self.client_id}: Best model saved to {best_model_path}")
+
+        # Scalar metrics only (keep payload small)
+        metrics = {
+            "train_loss": float(train_history["train_loss"][-1]),
+            "train_accuracy": float(train_history["train_accuracy"][-1]),
+            "val_loss": float(train_history["val_loss"][-1]),
+            "val_accuracy": float(train_history["val_accuracy"][-1]),
+            "val_f1": float(train_history["val_f1_macro"][-1]),
+            "test_accuracy": float(test_metrics["accuracy"]),
+            "test_f1": float(test_metrics["f1_macro"]),
+            "num_examples": int(len(self.train_loader.dataset)),
+            **xai_metrics,
+        }
+
+        logger.info(f"Client {self.client_id}: Local training completed")
+        return self.get_parameters(), len(self.train_loader.dataset), metrics
+
+    def evaluate(self, parameters: List[np.ndarray], config: Dict) -> Tuple[float, int, Dict]:
+        logger.info(f"Client {self.client_id}: Starting evaluation")
+        self.set_parameters(parameters)
+
+        test_metrics = self.trainer.evaluate(self.test_loader)
+        add_xai = self._xai_probe(self.val_loader, num_samples=12, save_k=0) if self.target_layer else {
+            "xai_del_auc_mean": 0.0, "xai_del_auc_std": 0.0
+        }
+        test_metrics.update(add_xai)
+
+        logger.info(f"Client {self.client_id}: Evaluation completed")
+        logger.info(f"  - Test Accuracy: {test_metrics['accuracy']:.4f}")
+        logger.info(f"  - Test F1 (Macro): {test_metrics['f1_macro']:.4f}")
+
+        return (
+            float(test_metrics.get("loss", 0.0)),
+            int(len(self.test_loader.dataset)),
+            {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in test_metrics.items()},
+        )
+
+    def _xai_probe(self, loader, num_samples: int = 16, save_k: int = 3) -> Dict:
+        if self.target_layer is None:
+            return {"xai_del_auc_mean": 0.0, "xai_del_auc_std": 0.0}
+
+        self.model.eval()
+        device = self.device
+        cam_engine = _GradCAM(self.model, self.target_layer)
+
+        del_aucs, saved, seen = [], 0, 0
+        for data, _ in loader:
+            B = data.size(0)
+            for i in range(B):
+                x = data[i:i+1].to(device)  # [1, C, H, W]
+
+                # Predict class without grads
+                with torch.no_grad():
+                    logits = self.model(x)
+                    pred_idx = int(torch.argmax(logits, dim=1).item())
+
+                # CAM with grads
+                with torch.enable_grad():
+                    x = x.requires_grad_(True)
+                    heat = cam_engine.generate(x, class_idx=pred_idx)  # [H,W], [0..1]
+
+                # Faithfulness metric (deletion AUC)
+                scores = _deletion_curve_scores(self.model, x.detach(), heat, steps=10)
+                del_aucs.append(_auc_trapz(scores))
+
+                # Save a few overlays
+                if save_k and saved < save_k:
+                    img = data[i, 0].cpu().numpy()
+                    img = (img - img.min()) / (img.max() - img.min() + 1e-12)
+                    img_u8 = (img * 255).astype(np.uint8)
+                    overlay_bgr = _overlay_on_gray(img_u8, heat, alpha=0.35)
+                    name = f"round_overlay_{saved + 1}.png"
+                    out_path = os.path.join(self.xai_dir, name)
+                    cv2.imwrite(out_path, overlay_bgr)
+                    saved += 1
+
+                seen += 1
+                if seen >= num_samples:
+                    break
+            if seen >= num_samples:
                 break
 
-            total_loss += epoch_loss
-            total_samples += epoch_samples
-            correct_predictions += epoch_correct
+        cam_engine.close()
 
-        if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
-            logger.info("Best model weights loaded.")
-
-        logger.info("Training loop completed.")
-        self.writer.close()
-
-        self.plot_training_history(metrics=['loss'], save_path=os.path.join(self.save_dir, 'loss_curve.png'))
-        self.plot_training_history(metrics=['accuracy'], save_path=os.path.join(self.save_dir, 'accuracy_curve.png'))
-
-        return self.history
-
-    
-
-    def evaluate(self, test_loader: DataLoader) -> Dict:
-        """Comprehensive evaluation on test set"""
-        self.model.eval()
-
-        all_predictions = []
-        all_labels = []
-        all_probabilities = []
-
-        with torch.no_grad():
-            progress_bar = tqdm(test_loader, desc='Testing')
-            for data, target in progress_bar:
-                data, target = data.to(self.device), target.to(self.device)
-
-                outputs = self.model(data)
-                probabilities = torch.softmax(outputs, dim=1)
-                _, predicted = torch.max(outputs.data, 1)
-
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(target.cpu().numpy())
-                all_probabilities.extend(probabilities.cpu().detach().numpy())
-            
-        # Calculate comprehensive metrics
-        test_metrics = self.metrics_calculator.calculate_metrics(
-            np.array(all_labels), 
-            np.array(all_predictions),
-            np.array(all_probabilities)
-        )
-        
-        # Generate and save confusion matrix
-        self.plot_confusion_matrix(all_labels, all_predictions)
-        
-        # Generate classification report
-        self._generate_classification_report(test_metrics)
-        
-        return test_metrics
-        
-
-    def plot_confusion_matrix(self, y_true: List, y_pred: List, save_path: str = None):
-        """Plot and save confusion matrix"""
-        cm = confusion_matrix(y_true, y_pred)
-        
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=self.metrics_calculator.class_names,
-                   yticklabels=self.metrics_calculator.class_names)
-        plt.title('Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        
-        if save_path is None:
-            save_path = os.path.join(self.save_dir, 'confusion_matrix.png')
-        
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        # plt.show()
-
-    def plot_training_history(self, metrics: List[str] = ['loss', 'accuracy'], save_path: str = None):
-        """Plot training history"""
-        fig, axes = plt.subplots(len(metrics), 1, figsize=(12, 4*len(metrics)))
-        if len(metrics) == 1:
-            axes = [axes]
-        
-        for i, metric in enumerate(metrics):
-            train_key = f'train_{metric}'
-            val_key = f'val_{metric}'
-            
-            if train_key in self.history and val_key in self.history:
-                axes[i].plot(self.history[train_key], label=f'Train {metric}')
-                axes[i].plot(self.history[val_key], label=f'Val {metric}')
-                axes[i].set_title(f'{metric.capitalize()} History')
-                axes[i].set_xlabel('Epoch')
-                axes[i].set_ylabel(metric.capitalize())
-                axes[i].legend()
-                axes[i].grid(True)
-        
-        plt.tight_layout()
-        
-        if save_path is None:
-            save_path = os.path.join(self.save_dir, 'training_history.png')
-        
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        # plt.show()
-
-
-    def save_checkpoint(self, epoch: int, train_metrics: Dict, val_metrics: Dict, is_best: bool = False):
-        """Save model checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics,
+        if not del_aucs:
+            return {"xai_del_auc_mean": 0.0, "xai_del_auc_std": 0.0}
+        return {
+            "xai_del_auc_mean": float(np.mean(del_aucs)),
+            "xai_del_auc_std": float(np.std(del_aucs)),
         }
-        
-        if is_best:
-            checkpoint_path = os.path.join(self.save_dir, 'best_model.pth')
-        else:
-            checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch+1}.pth')
-        
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
-    
-    def load_checkpoint(self, checkpoint_path: str) -> Dict:
-        """Load model checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Checkpoint loaded: {checkpoint_path}")
-        return checkpoint
-    
-    def _log_epoch_metrics(self, epoch: int, train_metrics: Dict, val_metrics: Dict):
-        """Log metrics to tensorboard and console"""
-        
-        # Log to tensorboard
-        for key, value in train_metrics.items():
-            self.writer.add_scalar(f'Train/{key}', value, epoch)
-        for key, value in val_metrics.items():
-            self.writer.add_scalar(f'Val/{key}', value, epoch)
-        
-        # Log to console
-        logger.info(f"Epoch {epoch+1}:")
-        logger.info(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
-        logger.info(f"  Val Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
-        logger.info(f"  Val F1: {val_metrics['f1_macro']:.4f}")
-    
-    def _generate_classification_report(self, metrics: Dict):
-        """Generate and save detailed classification report"""
-        report = {
-            'Overall Metrics': {
-                'Accuracy': f"{metrics['accuracy']:.4f}",
-                'Macro F1': f"{metrics['f1_macro']:.4f}",
-                'Weighted F1': f"{metrics['f1_weighted']:.4f}",
-            },
-            'Per-Class Metrics': {}
-        }
-        
-        for class_name in self.metrics_calculator.class_names:
-            class_key = class_name.lower()
-            report['Per-Class Metrics'][class_name] = {
-                'Precision': f"{metrics.get(f'{class_key}_precision', 0):.4f}",
-                'Recall': f"{metrics.get(f'{class_key}_recall', 0):.4f}",
-                'F1-Score': f"{metrics.get(f'{class_key}_f1', 0):.4f}",
-                'Sensitivity': f"{metrics.get(f'{class_key}_sensitivity', 0):.4f}",
-                'Specificity': f"{metrics.get(f'{class_key}_specificity', 0):.4f}",
-            }
-        
-        # Save report
-        report_path = os.path.join(self.save_dir, 'classification_report.json')
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        logger.info(f"Classification report saved: {report_path}")
-        
-        # Print summary
-        logger.info("=== CLASSIFICATION REPORT ===")
-        logger.info(f"Overall Accuracy: {metrics['accuracy']:.4f}")
-        logger.info(f"Macro F1-Score: {metrics['f1_macro']:.4f}")
-        
-        for class_name in self.metrics_calculator.class_names:
-            class_key = class_name.lower()
-            logger.info(f"{class_name}: F1={metrics.get(f'{class_key}_f1', 0):.4f}, "
-                       f"Precision={metrics.get(f'{class_key}_precision', 0):.4f}, "
-                       f"Recall={metrics.get(f'{class_key}_recall', 0):.4f}")
-            
 
-def get_optimizer(model: nn.Module, optimizer_name: str = 'adamw',
-                 learning_rate: float = 0.001, weight_decay: float = 1e-4) -> optim.Optimizer:
-    """Get optimizer for training"""
-    if optimizer_name.lower() == 'adamw':
-        return optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.lower() == 'adam':
-        return optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.lower() == 'sgd':
-        return optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-def get_scheduler(optimizer: optim.Optimizer, scheduler_name: str = 'plateau'):
-    """Get learning rate scheduler"""
-    if scheduler_name.lower() == 'plateau':
-        return optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
-    elif scheduler_name.lower() == 'cosine':
-        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
-    elif scheduler_name.lower() == 'step':
-        return optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-    else:
-        raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+def create_client(client_id: int, data_dir: str, model_name: str = "customcnn",
+                  batch_size: int = 16, local_epochs: int = 50, num_workers: int = 1) -> MedicalFLClient:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
 
+    client = MedicalFLClient(
+        client_id=client_id,
+        data_dir=data_dir,
+        device=device,
+        model_name=model_name,
+        num_classes=4,
+        batch_size=batch_size,
+        local_epochs=local_epochs,
+        num_workers=num_workers,
+    )
+    return client
+
+
+def run_flower(server_address: str, client: MedicalFLClient) -> None:
+    """Start Flower with simple auto-reconnect on transient UNAVAILABLE."""
+    while True:
+        try:
+            fl.client.start_client(
+                server_address=server_address,
+                client=client.to_client()
+            )
+            break  # finished cleanly
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                logger.warning("Server UNAVAILABLE (gRPC 14). Reconnecting in 5s...")
+                time.sleep(5)
+                continue
+            else:
+                raise
+
+
+def main():
+    # Use spawn to avoid forking a multi-threaded process (Flower/gRPC)
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Already set in this process
+        pass
+
+    _set_runtime_knobs(num_threads=4)
+
+    parser = argparse.ArgumentParser(description="Federated Learning Client for Medical Imaging")
+    parser.add_argument("--client-id", type=int, default=1, help="Client ID")
+    parser.add_argument("--data-dir", type=str, required=True, help="Path to client data directory")
+    parser.add_argument("--server-address", type=str, default="localhost:8080", help="FL server address")
+    parser.add_argument("--model", type=str, default="customcnn",
+                        choices=["mobilenetv3", "hybridmodel", "resnet50", "cnn", "hybridswin", "densenet121"],
+                        help="Model architecture")
+    parser.add_argument("--train-local", action="store_true", help="Run local training only (no FL server)")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (CPU-only: 32 for ResNet/DenseNet, 64 for small CNN/EfficientNetB0)")
+    parser.add_argument("--local-epochs", type=int, default=50, help="Local epochs per round")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (set 0 if problems)")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.data_dir):
+        raise ValueError(f"Data directory not found: {args.data_dir}")
+
+    client = create_client(
+        client_id=args.client_id,
+        data_dir=args.data_dir,
+        model_name=args.model,
+        batch_size=args.batch_size,
+        local_epochs=args.local_epochs,
+        num_workers=args.num_workers,
+    )
+
+    if args.train_local:
+        logger.info("Running standalone local training (no FL server)")
+        updated_params, num_examples, train_metrics = client.fit(client.get_parameters(), config={})
+        test_loss, test_examples, test_metrics = client.evaluate(updated_params, config={})
+        logger.info("Local training and evaluation completed:")
+        logger.info(f"  - Final train metrics: {train_metrics}")
+        logger.info(f"  - Final test metrics:  {test_metrics}")
+        return
+
+    logger.info(f"Starting FL client {args.client_id} connecting to {args.server_address}")
+    run_flower(args.server_address, client)
+
+
+if __name__ == "__main__":
+    main()
