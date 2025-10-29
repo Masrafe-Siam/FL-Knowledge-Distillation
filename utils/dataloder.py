@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from typing import List, Tuple, Optional, dict
+from typing import List, Tuple, Optional, Dict
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
@@ -57,7 +57,7 @@ class LoadDatasets(Dataset):
         
         return samples
     
-    def _calculate_class_weights(self) -> torch.Tensor:
+    def _compute_class_weights(self) -> torch.Tensor:
         """Calculate class weights for handling imbalanced datasets"""
         class_counts = [0] * len(self.class_to_idx)
         for _, label in self.samples:
@@ -267,12 +267,12 @@ def visualize_batch(data_loader: DataLoader, num_samples: int):
 
 def get_class_weights(data_loader: DataLoader) -> torch.Tensor:
     """Calculate class weights from data loader"""
-    class_counts = torch.zeros(3)
+    class_counts = torch.zeros(4)
     total_samples = 0
     
     for _, labels in data_loader:
         for label in labels:
             class_counts[label] += 1
             total_samples += 1
-    weights = total_samples / (3 * class_counts)
+    weights = total_samples / (4 * class_counts)
     return weights
