@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.HybridViTCNNMLP import HybridViTCNNMLP
+from models.cnn import CustomCNN
 
 
 def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropout_rate: float = 0.5):
@@ -13,6 +14,9 @@ def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropou
             dropout_rate=dropout_rate,
             freeze_backbones=False
         )
+    elif model_name == 'cnn':
+        model = CustomCNN(num_classes=num_classes)
+
     else:
         raise ValueError(f"Model '{model_name}' is not supported.")
     
