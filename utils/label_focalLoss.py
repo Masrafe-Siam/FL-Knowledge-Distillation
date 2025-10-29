@@ -29,7 +29,7 @@ class LabelSmoothingLoss(nn.Module):
     """
     Label smoothing loss for medical image classification
     """
-    def __init__(self, num_classes: int, smoothing: float = 0.1):
+    def __init__(self, num_classes: int = 4, smoothing: float = 0.1):
         super(LabelSmoothingLoss, self).__init__()
         self.num_classes = num_classes
         self.smoothing = smoothing
