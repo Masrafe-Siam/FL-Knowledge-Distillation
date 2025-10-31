@@ -129,3 +129,35 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
         fit_ins = fl.common.FitIns(parameters, config)
         return [(c, fit_ins) for c in clients]
+    
+    def configure_evaluate(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
+        # (configure_evaluate logic...)
+        if self.fraction_evaluate == 0.0: return []
+        config = self.on_evaluate_config_fn(server_round) if self.on_evaluate_config_fn else {}
+        sample_size, min_num = self.num_evaluation_clients(client_manager.num_available())
+        clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
+        eval_ins = fl.common.EvaluateIns(parameters, config)
+        return [(c, eval_ins) for c in clients]
+
+    def aggregate_fit(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]]):
+        # (aggregate_fit logic...)
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        if aggregated_parameters is None: return None, {}
+        self.last_parameters = aggregated_parameters
+        summary = self._calculate_fit_metrics(results)
+        # (history appending...)
+        self.history["round"].append(server_round)
+        self.history["train_loss"].append(summary["train_loss_avg"])
+        self.history["val_loss"].append(summary["val_loss_avg"])
+        self.history["val_f1"].append(summary["val_f1_avg"])
+        self.history["xai_del_auc_mean"].append(summary.get("xai_del_auc_mean_avg", np.nan))
+        # (best model check...)
+        if summary["val_f1_avg"] > self.best_f1:
+            self.best_f1 = summary["val_f1_avg"]
+            self.best_round = server_round
+            self.best_parameters = aggregated_parameters
+            self.save_best_model()
+            logger.info(f"🏆 New best model: round={self.best_round}, val_f1={self.best_f1:.4f}")
+        return aggregated_parameters, aggregated_metrics
+    
+    
