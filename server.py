@@ -188,7 +188,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         total_examples = sum(eval_res.num_examples for _, eval_res in results) or 1
         weighted_loss = sum(float(eval_res.loss or 0.0) * (eval_res.num_examples / total_examples) for _, eval_res in results)
         weighted_f1 = sum(float(eval_res.metrics.get("f1_macro", 0.0)) * (eval_res.num_examples / total_examples) for _, eval_res in results)
-        return {"test_loss_avg": weighted_loss, "test_f1_avg": weighted_f1} # (abbreviated)
+        return {"test_loss_avg": weighted_loss, "test_f1_avg": weighted_f1} # abbreviated
 
     def save_best_model(self):
         # save_best_model logic
@@ -273,7 +273,7 @@ def main():
     parser.add_argument("--fraction-fit", type=float, default=1.0)
     parser.add_argument("--fraction-evaluate", type=float, default=1.0)
     parser.add_argument("--model", type=str, default="densenet121", help="Teacher model architecture")
-    parser.add_argument("--num-classes", type=int, default=4, help="Number of classes") # <-- CHANGED
+    parser.add_argument("--num-classes", type=int, default=4, help="Number of classes")
     parser.add_argument("--local-epochs", type=int, default=6)
     
     # Distillation Pipeline Args 
@@ -290,7 +290,7 @@ def main():
 
     args = parser.parse_args()
 
-    # (Logging setup...)
+    # Logging setup
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", force=True)
     logger.info("Starting Federated Learning Server (Teacher Training)")
     logger.info(f"Config: {vars(args)}")
@@ -324,26 +324,26 @@ def main():
     except Exception as e:
         logger.error(f"FL Server failed: {e}", exc_info=True)
     finally:
-        # --- MODIFIED: Dynamic Distillation Trigger ---
+        # Dynamic Distillation Trigger
         if strategy is None or not strategy.history["round"]:
              logger.warning("FL training did not complete. No results to save or distill.")
              return # Exit if FL failed
 
         try:
-            # 1. Save all FL results first
+            # Save all FL results first
             strategy.save_final_results()
             strategy.save_last_model()
             logger.info("\nFL training complete. Final results saved.")
             logger.info(f"Results: {strategy.results_base_dir}")
             logger.info(f"Best round (Teacher): {strategy.best_round} | Best Val F1: {strategy.best_f1:.4f}")
 
-            # 2. Check if distillation is requested
+            # Check if distillation is requested
             if args.run_distillation:
                 logger.info("=" * 80)
-                logger.info("🚀 STARTING DYNAMIC KNOWLEDGE DISTILLATION 🚀")
+                logger.info("STARTING DYNAMIC KNOWLEDGE DISTILLATION")
                 logger.info("=" * 80)
 
-                # 3. Find the best saved teacher model
+                # Find the best saved teacher model
                 teacher_path = os.path.join(
                     strategy.results_base_dir,
                     f"best_model_round_{strategy.best_round}.pth"
@@ -359,7 +359,7 @@ def main():
                 logger.info(f"Using Teacher Model: {args.model} from {teacher_path}")
                 logger.info(f"Training Student Model: {args.student_model}")
 
-                # 4. Prepare the command to call distillation/distill.py
+                # Prepare the command to call distillation/distill.py
                 # Using sys.executable ensures we use the same Python (e.g., from venv)
                 cmd = [
                     sys.executable,
@@ -376,7 +376,7 @@ def main():
                 
                 logger.info(f"Running command: {' '.join(cmd)}")
 
-                # 5. Run the distillation script as a subprocess
+                # Run the distillation script as a subprocess
                 # We stream the output directly to the console instead of capturing
                 process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
                 
@@ -387,9 +387,18 @@ def main():
                 process.wait() # Wait for it to finish
 
                 if process.returncode == 0:
-                    logger.info("✅ Knowledge Distillation completed successfully.")
+                    logger.info("Knowledge Distillation completed successfully.")
                 else:
-                    logger.error(f"❌ Knowledge Distillation FAILED with return code {process.returncode}.")
+                    logger.error(f"Knowledge Distillation FAILED with return code {process.returncode}.")
 
         except Exception as e:
             logger.error(f"Error during shutdown/distillation: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    try:
+        import multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+    main()    
