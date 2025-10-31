@@ -5,10 +5,12 @@ import torch.nn.functional as F
 from models.HybridViTCNNMLP import HybridViTCNNMLP
 from models.cnn import CustomCNN
 from models.mobilenetv3 import MobileNetV3
+from models.denseNet121 import DenseNet121Medical
+from models.HybridSwinDenseNetMLP import HybridSwinDenseNetMLP
 
 
 def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropout_rate: float = 0.5):
-    if model_name == 'HVTCMLP': #HybridViTCNNMLP
+    if model_name == 'HVTCMLP':
         model = HybridViTCNNMLP(
             num_classes=num_classes,
             pretrained=pretrained,
@@ -22,6 +24,19 @@ def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropou
             num_classes=num_classes,
             pretrained=pretrained,
             dropout_rate=dropout_rate
+        )
+    elif model_name == 'densenet121':
+        model = DenseNet121Medical(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate
+        )
+    elif model_name == 'HSwinDNMLP':
+        model = HybridSwinDenseNetMLP(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout=dropout_rate,
+            freeze_backbones=False
         )
 
     else:
