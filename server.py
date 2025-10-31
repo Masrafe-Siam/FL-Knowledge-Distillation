@@ -203,4 +203,25 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             logger.info(f"Best model saved successfully → {save_path}")
         except Exception as exc: logger.error(f"Failed to save best model: {exc}", exc_info=True)
 
-        
+    def save_last_model(self):
+        # (save_last_model logic...)
+        if self.last_parameters is None: return
+        try:
+            model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
+            last_state_dict = OrderedDict()
+            for (name, param), arr in zip(model.state_dict().items(), fl.common.parameters_to_ndarrays(self.last_parameters)):
+                last_state_dict[name] = torch.as_tensor(arr, dtype=param.dtype)
+            save_path = os.path.join(self.results_base_dir, "last_global_model.pth")
+            torch.save({"model_state_dict": last_state_dict}, save_path)
+            logger.info(f"Last global model saved successfully → {save_path}")
+        except Exception as exc: logger.error(f"Failed to save last model: {exc}", exc_info=True)
+
+    def save_final_results(self):
+        # (save_final_results logic...)
+        try:
+            with open(os.path.join(self.results_base_dir, "final_training_history.json"), "w") as f:
+                json.dump(self.history, f, indent=2)
+            self.plot_training_curves(save_suffix="_final")
+        except Exception as e: logger.error(f"Failed to save final results: {e}", exc_info=True)
+
+    
