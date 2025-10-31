@@ -1,5 +1,6 @@
 venv/
 Dataset/
+Result/
 *.log
 *.tmp
 __pycache__/
