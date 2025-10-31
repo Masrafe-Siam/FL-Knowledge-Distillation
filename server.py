@@ -263,3 +263,133 @@ def create_server_strategy(*, min_clients: int, fraction_fit: float, fraction_ev
     )
 
 
+def main():
+    parser = argparse.ArgumentParser("Federated Learning Server")
+    # Standard FL Args 
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=8080, help="Port")
+    parser.add_argument("--rounds", type=int, default=3, help="FL rounds")
+    parser.add_argument("--min-clients", type=int, default=1, help="Minimum clients per round")
+    parser.add_argument("--fraction-fit", type=float, default=1.0)
+    parser.add_argument("--fraction-evaluate", type=float, default=1.0)
+    parser.add_argument("--model", type=str, default="densenet121", help="Teacher model architecture")
+    parser.add_argument("--num-classes", type=int, default=4, help="Number of classes") # <-- CHANGED
+    parser.add_argument("--local-epochs", type=int, default=6)
+    
+    # Distillation Pipeline Args 
+    parser.add_argument("--run-distillation", action="store_true", 
+                        help="Automatically run distillation after FL training completes")
+    parser.add_argument("--student-model", type=str, default="mobilenetv3", 
+                        help="Student model architecture for distillation")
+    parser.add_argument("--distill-data-dir", type=str, default="Dataset", 
+                        help="Path to the FULL dataset for distillation training")
+    parser.add_argument("--distill-save-dir", type=str, default="distillation/saved_models", 
+                        help="Where to save final student models")
+    parser.add_argument("--distill-epochs", type=int, default=50, help="Epochs for distillation training")
+    parser.add_argument("--distill-batch-size", type=int, default=32, help="Batch size for distillation")
+
+    args = parser.parse_args()
+
+    # (Logging setup...)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", force=True)
+    logger.info("Starting Federated Learning Server (Teacher Training)")
+    logger.info(f"Config: {vars(args)}")
+
+    strategy = None # Define strategy in outer scope
+    try:
+        strategy = create_server_strategy(
+            min_clients=args.min_clients,
+            fraction_fit=args.fraction_fit,
+            fraction_evaluate=args.fraction_evaluate,
+            model_name=args.model,
+            num_classes=args.num_classes,
+            local_epochs=args.local_epochs,
+        )
+        client_manager = LoggingClientManager()
+        server_cfg = fl.server.ServerConfig(num_rounds=args.rounds)
+        server_addr = f"{args.host}:{args.port}"
+
+        logger.info(f"Flower gRPC server starting at {server_addr} for {args.rounds} rounds...")
+        
+        fl.server.start_server(
+            server_address=server_addr,
+            config=server_cfg,
+            strategy=strategy,
+            client_manager=client_manager,
+            grpc_max_message_length=GRPC_MAX_MESSAGE_LENGTH,
+        )
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"FL Server failed: {e}", exc_info=True)
+    finally:
+        # --- MODIFIED: Dynamic Distillation Trigger ---
+        if strategy is None or not strategy.history["round"]:
+             logger.warning("FL training did not complete. No results to save or distill.")
+             return # Exit if FL failed
+
+        try:
+            # 1. Save all FL results first
+            strategy.save_final_results()
+            strategy.save_last_model()
+            logger.info("\nFL training complete. Final results saved.")
+            logger.info(f"Results: {strategy.results_base_dir}")
+            logger.info(f"Best round (Teacher): {strategy.best_round} | Best Val F1: {strategy.best_f1:.4f}")
+
+            # 2. Check if distillation is requested
+            if args.run_distillation:
+                logger.info("=" * 80)
+                logger.info("🚀 STARTING DYNAMIC KNOWLEDGE DISTILLATION 🚀")
+                logger.info("=" * 80)
+
+                # 3. Find the best saved teacher model
+                teacher_path = os.path.join(
+                    strategy.results_base_dir,
+                    f"best_model_round_{strategy.best_round}.pth"
+                )
+                if not os.path.exists(teacher_path) or strategy.best_round == 0:
+                    # Fallback to last model if best wasn't saved
+                    teacher_path = os.path.join(strategy.results_base_dir, "last_global_model.pth")
+
+                if not os.path.exists(teacher_path):
+                    logger.error("Could not find a trained teacher model to distill from. Skipping.")
+                    return # Exit
+
+                logger.info(f"Using Teacher Model: {args.model} from {teacher_path}")
+                logger.info(f"Training Student Model: {args.student_model}")
+
+                # 4. Prepare the command to call distillation/distill.py
+                # Using sys.executable ensures we use the same Python (e.g., from venv)
+                cmd = [
+                    sys.executable,
+                    "distillation/distill.py",
+                    "--teacher-model", args.model,
+                    "--teacher-path", teacher_path,
+                    "--student-model", args.student_model,
+                    "--data-dir", args.distill_data_dir,
+                    "--save-dir", args.distill_save_dir,
+                    "--num-classes", str(args.num_classes),
+                    "--epochs", str(args.distill_epochs),
+                    "--batch-size", str(args.distill_batch_size),
+                ]
+                
+                logger.info(f"Running command: {' '.join(cmd)}")
+
+                # 5. Run the distillation script as a subprocess
+                # We stream the output directly to the console instead of capturing
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+                
+                # Log output line by line as it comes
+                for line in iter(process.stdout.readline, ''):
+                    logger.info(f"[Distill] {line.strip()}")
+                
+                process.wait() # Wait for it to finish
+
+                if process.returncode == 0:
+                    logger.info("✅ Knowledge Distillation completed successfully.")
+                else:
+                    logger.error(f"❌ Knowledge Distillation FAILED with return code {process.returncode}.")
+
+        except Exception as e:
+            logger.error(f"Error during shutdown/distillation: {e}", exc_info=True)
