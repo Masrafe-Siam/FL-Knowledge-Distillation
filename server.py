@@ -116,3 +116,16 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         self._save_strategy_config()
         logger.info(f"FL Strategy initialized. Results will be in: {self.results_base_dir}")
 
+    def _save_strategy_config(self):
+        config = { "strategy": "MedicalFLStrategy", "model_name": self.model_name, "num_classes": self.num_classes, }
+        # (save config...)
+        with open(os.path.join(self.results_base_dir, "strategy_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+            
+    def configure_fit(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
+        # (configure_fit logic...)
+        config = self.on_fit_config_fn(server_round) if self.on_fit_config_fn else {}
+        sample_size, min_num = self.num_fit_clients(client_manager.num_available())
+        clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
+        fit_ins = fl.common.FitIns(parameters, config)
+        return [(c, fit_ins) for c in clients]
