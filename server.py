@@ -183,4 +183,24 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             "val_f1_avg": weighted_sums["val_f1"], "xai_del_auc_mean_avg": weighted_sums["xai_del_auc_mean"],
         } # (abbreviated for clarity)
     
-    
+    def _calculate_eval_metrics(self, results):
+        # (calculate eval logic...)
+        total_examples = sum(eval_res.num_examples for _, eval_res in results) or 1
+        weighted_loss = sum(float(eval_res.loss or 0.0) * (eval_res.num_examples / total_examples) for _, eval_res in results)
+        weighted_f1 = sum(float(eval_res.metrics.get("f1_macro", 0.0)) * (eval_res.num_examples / total_examples) for _, eval_res in results)
+        return {"test_loss_avg": weighted_loss, "test_f1_avg": weighted_f1} # (abbreviated)
+
+    def save_best_model(self):
+        # (save_best_model logic...)
+        if self.best_parameters is None: return
+        try:
+            model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
+            best_state_dict = OrderedDict()
+            for (name, param), arr in zip(model.state_dict().items(), fl.common.parameters_to_ndarrays(self.best_parameters)):
+                best_state_dict[name] = torch.as_tensor(arr, dtype=param.dtype)
+            save_path = os.path.join(self.results_base_dir, f"best_model_round_{self.best_round}.pth")
+            torch.save({"model_state_dict": best_state_dict}, save_path)
+            logger.info(f"Best model saved successfully → {save_path}")
+        except Exception as exc: logger.error(f"Failed to save best model: {exc}", exc_info=True)
+
+        
