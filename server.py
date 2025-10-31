@@ -160,4 +160,27 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             logger.info(f"🏆 New best model: round={self.best_round}, val_f1={self.best_f1:.4f}")
         return aggregated_parameters, aggregated_metrics
     
+    def aggregate_evaluate(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]]):
+        # (aggregate_evaluate logic...)
+        if not results: return None, {}
+        test = self._calculate_eval_metrics(results)
+        return test["test_loss_avg"], test
+
+    def _calculate_fit_metrics(self, results):
+        # (calculate fit logic...)
+        total_examples = sum(fit_res.num_examples for _, fit_res in results) or 1
+        metric_keys = ["train_loss", "train_accuracy", "train_f1", "val_loss", "val_accuracy", "val_f1",
+                       "xai_del_auc_mean", "xai_del_auc_std"]
+        weighted_sums = {key: 0.0 for key in metric_keys}
+        for _, fit_res in results:
+            weight = fit_res.num_examples / total_examples
+            for key in metric_keys:
+                val = fit_res.metrics.get(key, 0.0)
+                if isinstance(val, (int, float, np.integer, np.floating)):
+                    weighted_sums[key] += float(val) * weight
+        return {
+            "train_loss_avg": weighted_sums["train_loss"], "val_loss_avg": weighted_sums["val_loss"],
+            "val_f1_avg": weighted_sums["val_f1"], "xai_del_auc_mean_avg": weighted_sums["xai_del_auc_mean"],
+        } # (abbreviated for clarity)
+    
     
