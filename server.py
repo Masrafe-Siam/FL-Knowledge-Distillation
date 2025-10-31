@@ -44,7 +44,7 @@ def get_init_parameters(model_name: str, num_classes: int) -> fl.common.Paramete
 
 def fit_config(server_round: int, local_epochs: int) -> Dict[str, fl.common.Scalar]:
     config = { "server_round": server_round, "local_epochs": local_epochs, "learning_rate": 1e-3, }
-    # (Your dynamic LR/epoch logic...)
+    # dynamic LR/epoch logic
     return config
 
 def evaluate_config(server_round: int) -> Dict[str, fl.common.Scalar]:
@@ -99,7 +99,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         self.model_name = model_name
         self.num_classes = num_classes
 
-        # (History, best_f1, etc. definitions...)
+        # History, best_f1, etc. definitions
         self.history = { "round": [], "train_loss": [], "train_accuracy": [], "train_f1": [],
                          "val_loss": [], "val_accuracy": [], "val_f1": [],
                          "test_loss": [], "test_accuracy": [], "test_f1": [],
@@ -118,12 +118,12 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
 
     def _save_strategy_config(self):
         config = { "strategy": "MedicalFLStrategy", "model_name": self.model_name, "num_classes": self.num_classes, }
-        # (save config...)
+        # save config
         with open(os.path.join(self.results_base_dir, "strategy_config.json"), "w") as f:
             json.dump(config, f, indent=2)
             
     def configure_fit(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
-        # (configure_fit logic...)
+        # configure_fit logic
         config = self.on_fit_config_fn(server_round) if self.on_fit_config_fn else {}
         sample_size, min_num = self.num_fit_clients(client_manager.num_available())
         clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
@@ -131,7 +131,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         return [(c, fit_ins) for c in clients]
     
     def configure_evaluate(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
-        # (configure_evaluate logic...)
+        # configure_evaluate logic
         if self.fraction_evaluate == 0.0: return []
         config = self.on_evaluate_config_fn(server_round) if self.on_evaluate_config_fn else {}
         sample_size, min_num = self.num_evaluation_clients(client_manager.num_available())
@@ -140,18 +140,18 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         return [(c, eval_ins) for c in clients]
 
     def aggregate_fit(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]]):
-        # (aggregate_fit logic...)
+        # aggregate_fit logic
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
         if aggregated_parameters is None: return None, {}
         self.last_parameters = aggregated_parameters
         summary = self._calculate_fit_metrics(results)
-        # (history appending...)
+        # history appending
         self.history["round"].append(server_round)
         self.history["train_loss"].append(summary["train_loss_avg"])
         self.history["val_loss"].append(summary["val_loss_avg"])
         self.history["val_f1"].append(summary["val_f1_avg"])
         self.history["xai_del_auc_mean"].append(summary.get("xai_del_auc_mean_avg", np.nan))
-        # (best model check...)
+        # best model check
         if summary["val_f1_avg"] > self.best_f1:
             self.best_f1 = summary["val_f1_avg"]
             self.best_round = server_round
@@ -161,13 +161,13 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         return aggregated_parameters, aggregated_metrics
     
     def aggregate_evaluate(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]]):
-        # (aggregate_evaluate logic...)
+        # aggregate_evaluate logic
         if not results: return None, {}
         test = self._calculate_eval_metrics(results)
         return test["test_loss_avg"], test
 
     def _calculate_fit_metrics(self, results):
-        # (calculate fit logic...)
+        # calculate fit logic
         total_examples = sum(fit_res.num_examples for _, fit_res in results) or 1
         metric_keys = ["train_loss", "train_accuracy", "train_f1", "val_loss", "val_accuracy", "val_f1",
                        "xai_del_auc_mean", "xai_del_auc_std"]
@@ -181,17 +181,17 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         return {
             "train_loss_avg": weighted_sums["train_loss"], "val_loss_avg": weighted_sums["val_loss"],
             "val_f1_avg": weighted_sums["val_f1"], "xai_del_auc_mean_avg": weighted_sums["xai_del_auc_mean"],
-        } # (abbreviated for clarity)
+        } # abbreviated for clarity
     
     def _calculate_eval_metrics(self, results):
-        # (calculate eval logic...)
+        # calculate eval logic
         total_examples = sum(eval_res.num_examples for _, eval_res in results) or 1
         weighted_loss = sum(float(eval_res.loss or 0.0) * (eval_res.num_examples / total_examples) for _, eval_res in results)
         weighted_f1 = sum(float(eval_res.metrics.get("f1_macro", 0.0)) * (eval_res.num_examples / total_examples) for _, eval_res in results)
         return {"test_loss_avg": weighted_loss, "test_f1_avg": weighted_f1} # (abbreviated)
 
     def save_best_model(self):
-        # (save_best_model logic...)
+        # save_best_model logic
         if self.best_parameters is None: return
         try:
             model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
@@ -204,7 +204,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         except Exception as exc: logger.error(f"Failed to save best model: {exc}", exc_info=True)
 
     def save_last_model(self):
-        # (save_last_model logic...)
+        # save_last_model logic
         if self.last_parameters is None: return
         try:
             model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
@@ -217,11 +217,49 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         except Exception as exc: logger.error(f"Failed to save last model: {exc}", exc_info=True)
 
     def save_final_results(self):
-        # (save_final_results logic...)
+        # save_final_results logic
         try:
             with open(os.path.join(self.results_base_dir, "final_training_history.json"), "w") as f:
                 json.dump(self.history, f, indent=2)
             self.plot_training_curves(save_suffix="_final")
         except Exception as e: logger.error(f"Failed to save final results: {e}", exc_info=True)
 
-    
+    def plot_training_curves(self, save_suffix: str = ""):
+        # plot_training_curves logic
+        if not self.history["round"]: return
+        # (plotting logic...)
+        plt.figure()
+        plt.plot(self.history["round"], self.history["val_f1"], label="Val F1")
+        plt.savefig(os.path.join(self.results_base_dir, f"f1_curve{save_suffix}.png"))
+        plt.close()
+
+
+# LoggingClientManager, start_waiting_heartbeat, create_server_strategy
+class LoggingClientManager(SimpleClientManager):
+    def register(self, client: ClientProxy) -> bool:
+        ok = super().register(client)
+        logger.info(f"Client connected: {client.cid} | Total={self.num_available()}")
+        return ok
+
+def start_waiting_heartbeat(cm: SimpleClientManager, target: int, interval_sec: float = 2.0):
+
+    pass
+
+def create_server_strategy(*, min_clients: int, fraction_fit: float, fraction_evaluate: float,
+                           model_name: str, num_classes: int, local_epochs: int) -> MedicalFLStrategy:
+    initial_parameters = get_init_parameters(model_name, num_classes)
+    if initial_parameters is None:
+        raise RuntimeError("Failed to initialize model parameters")
+    return MedicalFLStrategy(
+        model_name=model_name, num_classes=num_classes,
+        fraction_fit=fraction_fit, fraction_evaluate=fraction_evaluate,
+        min_fit_clients=min_clients, min_evaluate_clients=min_clients,
+        min_available_clients=min_clients,
+        on_fit_config_fn=lambda r: fit_config(r, local_epochs),
+        on_evaluate_config_fn=evaluate_config,
+        initial_parameters=initial_parameters,
+        fit_metrics_aggregation_fn=weighted_average,
+        evaluate_metrics_aggregation_fn=weighted_average,
+    )
+
+
