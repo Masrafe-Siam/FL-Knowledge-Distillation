@@ -43,8 +43,25 @@ def get_init_parameters(model_name: str, num_classes: int) -> fl.common.Paramete
         return None
 
 def fit_config(server_round: int, local_epochs: int) -> Dict[str, fl.common.Scalar]:
-    config = { "server_round": server_round, "local_epochs": local_epochs, "learning_rate": 1e-3, }
-    # dynamic LR/epoch logic
+    """Per-round training config broadcast to clients."""
+    config = {
+        "server_round": server_round,
+        "local_epochs": local_epochs,
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "loss_function": "cross_entropy",
+        "optimizer": "adamw",
+        "scheduler": "plateau",
+        "use_scheduler": True,
+        "batch_size": 16,
+        "xai_probe": True,
+        "xai_samples": 16,
+        "xai_save_k": 0,
+    }
+    logger.info(
+        f"Round {server_round} training config: "
+        f"epochs={config['local_epochs']}, lr={config['learning_rate']}, loss={config['loss_function']}"
+    )
     return config
 
 def evaluate_config(server_round: int) -> Dict[str, fl.common.Scalar]:
@@ -63,6 +80,14 @@ def weighted_average(metrics: List[Tuple[int, Dict]]) -> Dict:
     return aggregated_metrics
 
 class MedicalFLStrategy(fl.server.strategy.FedAvg):
+    """
+    FedAvg strategy extended with:
+      - history tracking
+      - best/last global checkpoint saving
+      - detailed round logging & plots
+      - optional XAI metrics aggregation
+      
+    """
     def __init__(
         self,
         *,
@@ -99,139 +124,439 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         self.model_name = model_name
         self.num_classes = num_classes
 
-        # History, best_f1, etc. definitions
-        self.history = { "round": [], "train_loss": [], "train_accuracy": [], "train_f1": [],
-                         "val_loss": [], "val_accuracy": [], "val_f1": [],
-                         "test_loss": [], "test_accuracy": [], "test_f1": [],
-                         "xai_del_auc_mean": [], "xai_del_auc_std": [], }
+        self.history = {
+            "round": [],
+            "train_loss": [],
+            "train_accuracy": [],
+            "train_f1": [],
+            "val_loss": [],
+            "val_accuracy": [],
+            "val_f1": [],
+            "test_loss": [],
+            "test_accuracy": [],
+            "test_f1": [],
+            "num_clients": [],
+            "client_data_sizes": [],
+            "aggregation_time": [],
+            # ---- XAI history ----
+            "xai_del_auc_mean": [], "xai_del_auc_std": [],
+            "xai_heat_in_mask_mean": [], "xai_heat_in_mask_std": [],
+        }
         self.best_accuracy = 0.0
         self.best_f1 = 0.0
         self.best_round = 0
         self.best_parameters: Optional[fl.common.Parameters] = None
         self.last_parameters: Optional[fl.common.Parameters] = None
-        
+
+        self.connected_clients = set()
+        self.client_metrics_history = {}
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.results_base_dir = os.path.join(results_base_dir, f"fl_results_{model_name}_{ts}")
+        self.results_base_dir = os.path.join(results_base_dir, f"fl_results_{ts}")
         os.makedirs(self.results_base_dir, exist_ok=True)
         self._save_strategy_config()
-        logger.info(f"FL Strategy initialized. Results will be in: {self.results_base_dir}")
+
+        logger.info("FL Strategy initialized")
+        logger.info(f"   → results_base_dir: {self.results_base_dir}")
+        logger.info(f"   → model={self.model_name}, num_classes={self.num_classes}")
 
     def _save_strategy_config(self):
-        config = { "strategy": "MedicalFLStrategy", "model_name": self.model_name, "num_classes": self.num_classes, }
-        # save config
+        config = {
+            "strategy": "MedicalFLStrategy",
+            "model_name": self.model_name,
+            "num_classes": self.num_classes,
+            "fraction_fit": self.fraction_fit,
+            "fraction_evaluate": self.fraction_evaluate,
+            "min_fit_clients": self.min_fit_clients,
+            "min_evaluate_clients": self.min_evaluate_clients,
+            "min_available_clients": self.min_available_clients,
+            "accept_failures": self.accept_failures,
+            "timestamp": datetime.now().isoformat(),
+        }
         with open(os.path.join(self.results_base_dir, "strategy_config.json"), "w") as f:
             json.dump(config, f, indent=2)
-            
-    def configure_fit(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
-        # configure_fit logic
+
+    def configure_fit(
+        self,
+        server_round: int,
+        parameters: fl.common.Parameters,
+        client_manager: fl.server.client_manager.ClientManager,
+    ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitIns]]:
+        logger.info(f"Round {server_round}: configuring clients for training...")
         config = self.on_fit_config_fn(server_round) if self.on_fit_config_fn else {}
         sample_size, min_num = self.num_fit_clients(client_manager.num_available())
         clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
+        self.connected_clients.update({c.cid for c in clients})
+
+        logger.info(f"Selected {len(clients)} clients: {sorted([c.cid for c in clients])}")
         fit_ins = fl.common.FitIns(parameters, config)
         return [(c, fit_ins) for c in clients]
-    
-    def configure_evaluate(self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager):
-        # configure_evaluate logic
-        if self.fraction_evaluate == 0.0: return []
+
+    def configure_evaluate(
+        self,
+        server_round: int,
+        parameters: fl.common.Parameters,
+        client_manager: fl.server.client_manager.ClientManager,
+    ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
+        if self.fraction_evaluate == 0.0:
+            return []
+        logger.info(f"Round {server_round}: configuring clients for evaluation...")
         config = self.on_evaluate_config_fn(server_round) if self.on_evaluate_config_fn else {}
         sample_size, min_num = self.num_evaluation_clients(client_manager.num_available())
         clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num)
+        logger.info(f"Selected {len(clients)} clients for evaluation")
+
         eval_ins = fl.common.EvaluateIns(parameters, config)
         return [(c, eval_ins) for c in clients]
 
-    def aggregate_fit(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]]):
-        # aggregate_fit logic
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+        failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]],
+    ) -> Tuple[Optional[fl.common.Parameters], Dict[str, fl.common.Scalar]]:
+        t0 = time.time()
+        logger.info(
+            f"Round {server_round}: aggregating fit results (success={len(results)}, failures={len(failures)})"
+        )
+
+        if len(results) < self.min_fit_clients:
+            logger.warning(
+                f"Not enough results to aggregate. Expected {self.min_fit_clients}, got {len(results)}"
+            )
+            return None, {}
+
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
-        if aggregated_parameters is None: return None, {}
+        if aggregated_parameters is None:
+            return None, aggregated_metrics
+
         self.last_parameters = aggregated_parameters
+
+        # Summaries from client metrics
         summary = self._calculate_fit_metrics(results)
-        # history appending
         self.history["round"].append(server_round)
         self.history["train_loss"].append(summary["train_loss_avg"])
+        self.history["train_accuracy"].append(summary["train_accuracy_avg"])
+        self.history["train_f1"].append(summary["train_f1_avg"])
         self.history["val_loss"].append(summary["val_loss_avg"])
+        self.history["val_accuracy"].append(summary["val_accuracy_avg"])
         self.history["val_f1"].append(summary["val_f1_avg"])
+        self.history["num_clients"].append(len(results))
+        self.history["client_data_sizes"].append(summary["client_data_sizes"])
+        self.history["aggregation_time"].append(time.time() - t0)
+
+        # XAI history (only if keys exist in summary)
         self.history["xai_del_auc_mean"].append(summary.get("xai_del_auc_mean_avg", np.nan))
-        # best model check
+        self.history["xai_del_auc_std"].append(summary.get("xai_del_auc_std_avg", np.nan))
+        self.history["xai_heat_in_mask_mean"].append(summary.get("xai_heat_in_mask_mean_avg", np.nan))
+        self.history["xai_heat_in_mask_std"].append(summary.get("xai_heat_in_mask_std_avg", np.nan))
+
+        # Track best by validation F1
         if summary["val_f1_avg"] > self.best_f1:
             self.best_f1 = summary["val_f1_avg"]
+            self.best_accuracy = summary["val_accuracy_avg"]
             self.best_round = server_round
             self.best_parameters = aggregated_parameters
             self.save_best_model()
-            logger.info(f"🏆 New best model: round={self.best_round}, val_f1={self.best_f1:.4f}")
+            logger.info(
+                f"🏆 New best model: round={self.best_round}, val_f1={self.best_f1:.4f}, val_acc={self.best_accuracy:.4f}"
+            )
+
+        aggregated_metrics.update({k: v for k, v in summary.items() if k.startswith("xai_")})
+        aggregated_metrics["aggregation_time"] = self.history["aggregation_time"][-1]
+        self._log_round_summary(server_round, summary, len(results))
+
+        # Periodic snapshot
+        if server_round % 10 == 0:
+            self.save_intermediate_results(server_round)
+
         return aggregated_parameters, aggregated_metrics
-    
-    def aggregate_evaluate(self, server_round: int, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]], failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]]):
-        # aggregate_evaluate logic
-        if not results: return None, {}
+
+    def aggregate_evaluate(
+        self,
+        server_round: int,
+        results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]],
+        failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]],
+    ) -> Tuple[Optional[float], Dict[str, fl.common.Scalar]]:
+        logger.info(
+            f"Round {server_round}: aggregating evaluation results (success={len(results)} fail={len(failures)})"
+        )
+        if not results:
+            return None, {}
         test = self._calculate_eval_metrics(results)
+        if len(self.history["test_loss"]) < len(self.history["round"]):
+            self.history["test_loss"].append(test["test_loss_avg"])
+            self.history["test_accuracy"].append(test["test_accuracy_avg"])
+            self.history["test_f1"].append(test["test_f1_avg"])
+        logger.info(
+            f"   Test: loss={test['test_loss_avg']:.4f} acc={test['test_accuracy_avg']:.4f} f1={test['test_f1_avg']:.4f}"
+        )
         return test["test_loss_avg"], test
 
     def _calculate_fit_metrics(self, results):
-        # calculate fit logic
         total_examples = sum(fit_res.num_examples for _, fit_res in results) or 1
-        metric_keys = ["train_loss", "train_accuracy", "train_f1", "val_loss", "val_accuracy", "val_f1",
-                       "xai_del_auc_mean", "xai_del_auc_std"]
+        metric_keys = [
+            "train_loss", "train_accuracy", "train_f1",
+            "val_loss", "val_accuracy", "val_f1",
+            "xai_del_auc_mean", "xai_del_auc_std",
+            "xai_heat_in_mask_mean", "xai_heat_in_mask_std",
+        ]
+
         weighted_sums = {key: 0.0 for key in metric_keys}
-        for _, fit_res in results:
+        present = {key: False for key in metric_keys}
+        client_data_sizes, client_metrics_list = [], []
+
+        for client_proxy, fit_res in results:
             weight = fit_res.num_examples / total_examples
+            client_data_sizes.append(fit_res.num_examples)
+            metrics_for_client = {}
             for key in metric_keys:
-                val = fit_res.metrics.get(key, 0.0)
+                val = fit_res.metrics.get(key, None) if fit_res.metrics else None
                 if isinstance(val, (int, float, np.integer, np.floating)):
                     weighted_sums[key] += float(val) * weight
-        return {
-            "train_loss_avg": weighted_sums["train_loss"], "val_loss_avg": weighted_sums["val_loss"],
-            "val_f1_avg": weighted_sums["val_f1"], "xai_del_auc_mean_avg": weighted_sums["xai_del_auc_mean"],
-        } # abbreviated for clarity
-    
-    def _calculate_eval_metrics(self, results):
-        # calculate eval logic
+                    present[key] = True
+                    metrics_for_client[key] = float(val)
+            client_metrics_list.append({
+                "client_id": client_proxy.cid,
+                "num_examples": fit_res.num_examples,
+                "metrics": metrics_for_client,
+            })
+
+        current_round = len(self.history["round"]) + 1
+        self.client_metrics_history[current_round] = client_metrics_list
+
+        out = {
+            "train_loss_avg": weighted_sums["train_loss"],
+            "train_accuracy_avg": weighted_sums["train_accuracy"],
+            "train_f1_avg": weighted_sums["train_f1"],
+            "val_loss_avg": weighted_sums["val_loss"],
+            "val_accuracy_avg": weighted_sums["val_accuracy"],
+            "val_f1_avg": weighted_sums["val_f1"],
+            "total_examples": total_examples,
+            "client_data_sizes": client_data_sizes,
+            "num_participating_clients": len(results),
+        }
+        if present["xai_del_auc_mean"]:
+            out["xai_del_auc_mean_avg"] = weighted_sums["xai_del_auc_mean"]
+            out["xai_del_auc_std_avg"]  = weighted_sums["xai_del_auc_std"]
+        if present["xai_heat_in_mask_mean"]:
+            out["xai_heat_in_mask_mean_avg"] = weighted_sums["xai_heat_in_mask_mean"]
+            out["xai_heat_in_mask_std_avg"]  = weighted_sums["xai_heat_in_mask_std"]
+        return out
+
+    def _calculate_eval_metrics(
+        self, results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]]
+    ) -> Dict:
         total_examples = sum(eval_res.num_examples for _, eval_res in results) or 1
-        weighted_loss = sum(float(eval_res.loss or 0.0) * (eval_res.num_examples / total_examples) for _, eval_res in results)
-        weighted_f1 = sum(float(eval_res.metrics.get("f1_macro", 0.0)) * (eval_res.num_examples / total_examples) for _, eval_res in results)
-        return {"test_loss_avg": weighted_loss, "test_f1_avg": weighted_f1} # abbreviated
+        weighted_loss = 0.0
+        weighted_accuracy = 0.0
+        weighted_f1 = 0.0
 
-    def save_best_model(self):
-        # save_best_model logic
-        if self.best_parameters is None: return
+        for _, eval_res in results:
+            weight = eval_res.num_examples / total_examples
+            weighted_loss += float(eval_res.loss or 0.0) * weight
+            if eval_res.metrics:
+                weighted_accuracy += float(eval_res.metrics.get("accuracy", 0.0)) * weight
+                weighted_f1 += float(eval_res.metrics.get("f1_macro", 0.0)) * weight
+
+        return {
+            "test_loss_avg": weighted_loss,
+            "test_accuracy_avg": weighted_accuracy,
+            "test_f1_avg": weighted_f1,
+            "total_test_examples": total_examples,
+            "num_eval_clients": len(results),
+        }
+
+    def _log_round_summary(self, round_num: int, summary: Dict, num_clients: int):
+        logger.info("=" * 80)
+        logger.info(f"ROUND {round_num} SUMMARY")
+        logger.info("=" * 80)
+        logger.info(f"Clients: {num_clients} | examples: {summary['total_examples']:,}")
+        logger.info(
+            f"Train: loss={summary['train_loss_avg']:.4f} "
+            f"acc={summary['train_accuracy_avg']:.4f} f1={summary['train_f1_avg']:.4f}"
+        )
+        logger.info(
+            f"Val  : loss={summary['val_loss_avg']:.4f} "
+            f"acc={summary['val_accuracy_avg']:.4f} f1={summary['val_f1_avg']:.4f}"
+        )
+        logger.info(f"Best : round={self.best_round} val_f1={self.best_f1:.4f} val_acc={self.best_accuracy:.4f}")
+
+        xai_mean = summary.get("xai_del_auc_mean_avg", None)
+        if xai_mean is not None:
+            logger.info(
+                f"XAI  : delAUC={xai_mean:.4f} "
+                f"mask_in={summary.get('xai_heat_in_mask_mean_avg','NA')}"
+            )
+
+        logger.info("=" * 80)
+
+    def save_best_model(self) -> None:
+        if self.best_parameters is None:
+            logger.warning("No best parameters available, skipping model save.")
+            return
         try:
+            models_dir = os.path.join(os.path.dirname(__file__), "models")
+            if models_dir not in sys.path:
+                sys.path.insert(0, models_dir)
+
             model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
+
             best_state_dict = OrderedDict()
-            for (name, param), arr in zip(model.state_dict().items(), fl.common.parameters_to_ndarrays(self.best_parameters)):
+            for (name, param), arr in zip(
+                model.state_dict().items(),
+                fl.common.parameters_to_ndarrays(self.best_parameters),
+            ):
                 best_state_dict[name] = torch.as_tensor(arr, dtype=param.dtype)
-            save_path = os.path.join(self.results_base_dir, f"best_model_round_{self.best_round}.pth")
-            torch.save({"model_state_dict": best_state_dict}, save_path)
-            logger.info(f"Best model saved successfully → {save_path}")
-        except Exception as exc: logger.error(f"Failed to save best model: {exc}", exc_info=True)
 
-    def save_last_model(self):
-        # save_last_model logic
-        if self.last_parameters is None: return
+            checkpoint = {
+                "round": self.best_round,
+                "model_state_dict": best_state_dict,
+                "best_f1": self.best_f1,
+                "best_accuracy": self.best_accuracy,
+                "model_name": self.model_name,
+                "num_classes": self.num_classes,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            save_path = os.path.join(self.results_base_dir, f"best_model_round_{self.best_round}.pth")
+            torch.save(checkpoint, save_path)
+            logger.info(f"Best model saved successfully → {save_path}")
+
+        except Exception as exc:
+            logger.error(f"Failed to save best model: {exc}", exc_info=True)
+
+    def save_last_model(self) -> None:
+        if self.last_parameters is None:
+            logger.warning("No last parameters available, skipping model save.")
+            return
         try:
+            models_dir = os.path.join(os.path.dirname(__file__), "models")
+            if models_dir not in sys.path:
+                sys.path.insert(0, models_dir)
+
             model = get_model(self.model_name, num_classes=self.num_classes, pretrained=False)
+
             last_state_dict = OrderedDict()
-            for (name, param), arr in zip(model.state_dict().items(), fl.common.parameters_to_ndarrays(self.last_parameters)):
+            for (name, param), arr in zip(
+                model.state_dict().items(),
+                fl.common.parameters_to_ndarrays(self.last_parameters),
+            ):
                 last_state_dict[name] = torch.as_tensor(arr, dtype=param.dtype)
+
+            checkpoint = {
+                "model_state_dict": last_state_dict,
+                "model_name": self.model_name,
+                "num_classes": self.num_classes,
+                "timestamp": datetime.now().isoformat(),
+            }
+
             save_path = os.path.join(self.results_base_dir, "last_global_model.pth")
-            torch.save({"model_state_dict": last_state_dict}, save_path)
+            torch.save(checkpoint, save_path)
             logger.info(f"Last global model saved successfully → {save_path}")
-        except Exception as exc: logger.error(f"Failed to save last model: {exc}", exc_info=True)
+
+        except Exception as exc:
+            logger.error(f"Failed to save last model: {exc}", exc_info=True)
+
+    def save_intermediate_results(self, rnd: int):
+        try:
+            with open(os.path.join(self.results_base_dir, f"history_round_{rnd}.json"), "w") as f:
+                json.dump(self.history, f, indent=2)
+            with open(os.path.join(self.results_base_dir, f"client_metrics_round_{rnd}.json"), "w") as f:
+                json.dump(self.client_metrics_history, f, indent=2)
+            self.plot_training_curves(save_suffix=f"_round_{rnd}")
+            logger.info(f"Intermediate results saved for round {rnd}")
+        except Exception as e:
+            logger.error(f"Failed to save intermediate results: {e}", exc_info=True)
 
     def save_final_results(self):
-        # save_final_results logic
         try:
             with open(os.path.join(self.results_base_dir, "final_training_history.json"), "w") as f:
                 json.dump(self.history, f, indent=2)
+            with open(os.path.join(self.results_base_dir, "final_client_metrics.json"), "w") as f:
+                json.dump(self.client_metrics_history, f, indent=2)
             self.plot_training_curves(save_suffix="_final")
-        except Exception as e: logger.error(f"Failed to save final results: {e}", exc_info=True)
+            logger.info(f"Final results saved in {self.results_base_dir}")
+        except Exception as e:
+            logger.error(f"Failed to save final results: {e}", exc_info=True)
 
     def plot_training_curves(self, save_suffix: str = ""):
-        # plot_training_curves logic
-        if not self.history["round"]: return
-        # (plotting logic...)
-        plt.figure()
-        plt.plot(self.history["round"], self.history["val_f1"], label="Val F1")
-        plt.savefig(os.path.join(self.results_base_dir, f"f1_curve{save_suffix}.png"))
+        if not self.history["round"]:
+            return
+        rounds = self.history["round"]
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+        # Loss
+        axes[0, 0].plot(rounds, self.history["train_loss"], label="Train Loss", linewidth=2, marker="o")
+        axes[0, 0].plot(rounds, self.history["val_loss"], label="Val Loss", linewidth=2, marker="s")
+        if self.history["test_loss"]:
+            # FIX: Slice the rounds to match the number of available test loss points
+            num_test_points = len(self.history["test_loss"])
+            axes[0, 0].plot(rounds[:num_test_points], self.history["test_loss"], label="Test Loss", linewidth=2, marker="^")
+        axes[0, 0].set_title("Loss")
+
+        # Acc
+        axes[0, 1].plot(rounds, self.history["train_accuracy"], label="Train Acc", linewidth=2, marker="o")
+        axes[0, 1].plot(rounds, self.history["val_accuracy"], label="Val Acc", linewidth=2, marker="s")
+        if self.history["test_accuracy"]:
+            # FIX: Slice the rounds to match the number of available test accuracy points
+            num_test_points = len(self.history["test_accuracy"])
+            axes[0, 1].plot(rounds[:num_test_points], self.history["test_accuracy"], label="Test Acc", linewidth=2, marker="^")
+        axes[0, 1].set_title("Accuracy")
+
+        # F1
+        axes[0, 2].plot(rounds, self.history["train_f1"], label="Train F1", linewidth=2, marker="o")
+        axes[0, 2].plot(rounds, self.history["val_f1"], label="Val F1", linewidth=2, marker="s")
+        if self.history["test_f1"]:
+            # FIX: Slice the rounds to match the number of available test F1 points
+            num_test_points = len(self.history["test_f1"])
+            axes[0, 2].plot(rounds[:num_test_points], self.history["test_f1"], label="Test F1", linewidth=2, marker="^")
+        axes[0, 2].set_title("F1-Score")
+
+        # Clients per round
+        axes[1, 0].bar(rounds, self.history["num_clients"], alpha=0.8, label="Clients")
+        axes[1, 0].set_title("Clients per Round")
+
+        # Aggregation time
+        if self.history["aggregation_time"]:
+            axes[1, 1].plot(rounds, self.history["aggregation_time"], linewidth=2, marker="d", label="Agg Time (s)")
+            axes[1, 1].set_title("Aggregation Time (s)")
+
+        # Data distribution (latest round)
+        if self.history["client_data_sizes"]:
+            latest = self.history["client_data_sizes"][-1]
+            labels = [f"C{i+1}" for i in range(len(latest))]
+            axes[1, 2].pie(latest, labels=labels, autopct="%1.1f%%", startangle=90)
+            axes[1, 2].set_title("Data Distribution (latest)")
+
+        for ax in axes.ravel():
+            ax.grid(True, alpha=0.3)
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(loc="best")
+
+        plt.tight_layout()
+        out = os.path.join(self.results_base_dir, f"training_curves{save_suffix}.png")
+        plt.savefig(out, dpi=300, bbox_inches="tight")
         plt.close()
+        logger.info(f"Saved plot → {out}")
+
+    # def save_final_results(self):
+    #     # save_final_results logic
+    #     try:
+    #         with open(os.path.join(self.results_base_dir, "final_training_history.json"), "w") as f:
+    #             json.dump(self.history, f, indent=2)
+    #         self.plot_training_curves(save_suffix="_final")
+    #     except Exception as e: logger.error(f"Failed to save final results: {e}", exc_info=True)
+
+    # def plot_training_curves(self, save_suffix: str = ""):
+    #     # plot_training_curves logic
+    #     if not self.history["round"]: return
+    #     # (plotting logic...)
+    #     plt.figure()
+    #     plt.plot(self.history["round"], self.history["val_f1"], label="Val F1")
+    #     plt.savefig(os.path.join(self.results_base_dir, f"f1_curve{save_suffix}.png"))
+    #     plt.close()
 
 
 # LoggingClientManager, start_waiting_heartbeat, create_server_strategy

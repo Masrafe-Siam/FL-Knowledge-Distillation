@@ -267,7 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, required=True, help="Path to the training/validation dataset")
     parser.add_argument("--save-dir", type=str, default="distillation/saved_models", help="Directory to save student models")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of classes (e.g., 4 for brain tumor)")
-    parser.add_aFargument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--alpha", type=float, default=0.1, help="Weight for hard label loss")
