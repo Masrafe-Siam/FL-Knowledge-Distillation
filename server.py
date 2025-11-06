@@ -299,7 +299,8 @@ def main():
     parser.add_argument("--min-clients", type=int, default=1, help="Minimum clients per round")
     parser.add_argument("--fraction-fit", type=float, default=1.0)
     parser.add_argument("--fraction-evaluate", type=float, default=1.0)
-    parser.add_argument("--model", type=str, default="densenet121", help="Teacher model architecture")
+    parser.add_argument("--model", type=str, default="densenet121", 
+                        choices=["mobilenetv3", "hybridmodel", "resnet50", "cnn", "hybridswin", "densenet121"], help="Teacher model architecture")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of classes")
     parser.add_argument("--local-epochs", type=int, default=6)
     
@@ -314,8 +315,12 @@ def main():
                         help="Where to save final student models")
     parser.add_argument("--distill-epochs", type=int, default=50, help="Epochs for distillation training")
     parser.add_argument("--distill-batch-size", type=int, default=32, help="Batch size for distillation")
-
+    parser.add_argument("--expected-clients", type=int, default=None,
+                        help="How many clients you expect to connect (for logs). Defaults to --min-clients.")
     args = parser.parse_args()
+
+    if args.expected_clients is None:
+        args.expected_clients = args.min_clients
 
     # Logging setup
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", force=True)
@@ -332,11 +337,14 @@ def main():
             num_classes=args.num_classes,
             local_epochs=args.local_epochs,
         )
-        client_manager = LoggingClientManager()
+        client_manager = LoggingClientManager(expected_clients=args.expected_clients)
         server_cfg = fl.server.ServerConfig(num_rounds=args.rounds)
         server_addr = f"{args.host}:{args.port}"
 
-        logger.info(f"Flower gRPC server starting at {server_addr} for {args.rounds} rounds...")
+        logger.info(f"🌐 Flower gRPC server → {server_addr}")
+        logger.info(f"🎯 Expecting {args.expected_clients} clients to connect")
+
+        hb_stop = start_waiting_heartbeat(client_manager, args.expected_clients, interval_sec=2.0)
         
         fl.server.start_server(
             server_address=server_addr,
@@ -345,6 +353,10 @@ def main():
             client_manager=client_manager,
             grpc_max_message_length=GRPC_MAX_MESSAGE_LENGTH,
         )
+        try:
+            hb_stop.set()
+        except Exception:
+            pass
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
