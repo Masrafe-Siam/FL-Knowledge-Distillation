@@ -236,14 +236,41 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
 
 # LoggingClientManager, start_waiting_heartbeat, create_server_strategy
 class LoggingClientManager(SimpleClientManager):
+    def __init__(self, expected_clients: int):
+        super().__init__()
+        self.expected_clients = expected_clients
+
     def register(self, client: ClientProxy) -> bool:
         ok = super().register(client)
-        logger.info(f"Client connected: {client.cid} | Total={self.num_available()}")
+        n = self.num_available()
+        remaining = max(self.expected_clients - n, 0)
+        logger.info(f"Client connected: {client.cid} | connected={n} | waiting={remaining}")
+        if n >= self.expected_clients:
+            logger.info("Required clients connected. Starting rounds as soon as strategy is ready.")
         return ok
 
-def start_waiting_heartbeat(cm: SimpleClientManager, target: int, interval_sec: float = 2.0):
+    def unregister(self, client: ClientProxy) -> None:
+        super().unregister(client)
+        n = self.num_available()
+        remaining = max(self.expected_clients - n, 0)
+        logger.info(f"Client disconnected: {client.cid} | connected={n} | waiting={remaining}")
 
-    pass
+def start_waiting_heartbeat(cm: SimpleClientManager, target: int, interval_sec: float = 2.0):
+    stop_evt = threading.Event()
+
+    def _loop():
+        while not stop_evt.is_set():
+            connected = cm.num_available()
+            remaining = max(target - connected, 0)
+            if remaining <= 0:
+                stop_evt.set()
+                break
+            logger.info(f"⏳ Waiting for clients… connected={connected} | waiting={remaining}")
+            time.sleep(interval_sec)
+
+    thr = threading.Thread(target=_loop, daemon=True)
+    thr.start()
+    return stop_evt
 
 def create_server_strategy(*, min_clients: int, fraction_fit: float, fraction_evaluate: float,
                            model_name: str, num_classes: int, local_epochs: int) -> MedicalFLStrategy:
@@ -283,7 +310,7 @@ def main():
                         help="Student model architecture for distillation")
     parser.add_argument("--distill-data-dir", type=str, default="Dataset", 
                         help="Path to the FULL dataset for distillation training")
-    parser.add_argument("--distill-save-dir", type=str, default="distillation/saved_models", 
+    parser.add_argument("--distill-save-dir", type=str, default="Result/distillation/saved_models", 
                         help="Where to save final student models")
     parser.add_argument("--distill-epochs", type=int, default=50, help="Epochs for distillation training")
     parser.add_argument("--distill-batch-size", type=int, default=32, help="Batch size for distillation")
