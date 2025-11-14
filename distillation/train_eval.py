@@ -143,20 +143,24 @@ def plot_confusion_matrix(
     title: str = "Confusion Matrix",
 ):
     """
-    Save confusion matrix as a PNG heatmap.
-    cm: 2D array (num_classes x num_classes)
-    class_names: list of class labels (strings)
+    Save confusion matrix as a PNG heatmap using a classic white→green colormap.
+    Higher values = darker green. Background is near white.
     """
     import numpy as np
+    from matplotlib import cm as mpl_cm
 
+    # optional normalization (row-wise)
     if normalize:
         cm = cm.astype("float")
         row_sums = cm.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0 
-        cm = cm / row_sums
+        row_sums[row_sums == 0] = 1.0  # avoid div by zero
+        cm = cm / row_sums  # values in [0,1]
 
-    plt.figure(figsize=(6, 5))
-    plt.imshow(cm, interpolation="nearest")
+    green_cmap = mpl_cm.get_cmap("Greens")  # traditional confusion-matrix style
+
+    plt.figure(figsize=(8, 7))
+    # vmin/vmax make 0 = light/white, 1 = darkest green when normalized
+    plt.imshow(cm, interpolation="nearest", cmap=green_cmap, vmin=0.0, vmax=1.0 if normalize else None)
     plt.title(title)
     plt.colorbar()
 
@@ -175,16 +179,18 @@ def plot_confusion_matrix(
                 format(cm[i, j], fmt),
                 horizontalalignment="center",
                 verticalalignment="center",
-                fontsize=8,
+                fontsize=9,
                 color="white" if cm[i, j] > thresh else "black",
             )
 
-    plt.ylabel("True label")
-    plt.xlabel("Predicted label")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved confusion matrix PNG to {save_path}")
+
+
 
 
 def plot_curves(
@@ -343,8 +349,9 @@ def train_kd(
         logger.info(f"Saved best confusion matrix to {cm_txt_path}")
 
         # Save normalized confusion matrix as PNG heatmap
-        class_names = [str(i) for i in range(num_classes)]  # or pass real labels
+        class_names = ["Glioma_tumor", "Healthy", "Meningioma_tumor", "Pituitary_tumor"]
         cm_png_path = os.path.join(metrics_dir, f"{run_name}_confusion_matrix.png")
+
         plot_confusion_matrix(
             best_cm,
             class_names=class_names,
@@ -352,6 +359,5 @@ def train_kd(
             normalize=True,
             title=f"Confusion Matrix ({run_name})",
         )
-
     return history, best_model_path, best_cm
 
