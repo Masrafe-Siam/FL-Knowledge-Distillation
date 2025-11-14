@@ -636,7 +636,7 @@ def main():
                         help="Student model architecture for distillation")
     parser.add_argument("--distill-data-dir", type=str, default="Dataset", 
                         help="Path to the FULL dataset for distillation training")
-    parser.add_argument("--distill-save-dir", type=str, default="Result/distillation/saved_models", 
+    parser.add_argument("--distill-save-dir", type=str, default="Result/Distillation", 
                         help="Where to save final student models")
     parser.add_argument("--distill-epochs", type=int, default=50, help="Epochs for distillation training")
     parser.add_argument("--distill-batch-size", type=int, default=32, help="Batch size for distillation")

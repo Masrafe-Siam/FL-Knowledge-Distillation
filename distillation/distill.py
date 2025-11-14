@@ -3,133 +3,135 @@ import argparse
 import logging
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-from tqdm import tqdm
 import torch.nn as nn
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.modelEngine import get_model
-from utils.dataloder import create_data_loaders 
+from utils.dataloder import create_data_loaders
 from distillation.loss import DistillationLoss
+from distillation.train_eval import train_kd
+
+# Root folder for all KD results
+RESULTS_ROOT = os.path.abspath(os.path.join("Result", "Distillation"))
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger("Distillation")
+
 
 def load_checkpoint_flex(model: nn.Module, path: str, device: torch.device):
+    """Load a checkpoint with some flexibility about key names / wrapping."""
     sd = torch.load(path, map_location=device)
+
+    # If this is a wrapper dict, try common keys
     if isinstance(sd, dict):
         for k in ["model_state_dict", "state_dict", "weights", "model"]:
             if k in sd and isinstance(sd[k], dict):
                 sd = sd[k]
                 break
+        # Keep only tensor entries if it looks like a bigger dict
         if not all(isinstance(v, torch.Tensor) for v in sd.values()):
-            sd = {k:v for k,v in sd.items() if isinstance(v, torch.Tensor)} or sd
-    new_sd = {}
-    for k,v in sd.items():
-        if k.startswith("module."): k = k[7:]
-        if k.startswith("model."):  k = k[6:]
-        new_sd[k] = v
-    missing, unexpected = model.load_state_dict(new_sd, strict=False)
-    if missing:   print(f"Warning: Missing keys: {missing}")
-    if unexpected:print(f"Warning: Unexpected keys: {unexpected}")
+            sd = {k: v for k, v in sd.items() if isinstance(v, torch.Tensor)} or sd
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-logger = logging.getLogger("Distillation")
+    # Strip common prefixes like "module." or "model."
+    new_sd = {}
+    for k, v in sd.items():
+        if k.startswith("module."):
+            k = k[7:]
+        if k.startswith("model."):
+            k = k[6:]
+        new_sd[k] = v
+
+    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+    if missing:
+        logger.warning(f"Missing keys when loading teacher: {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys when loading teacher: {unexpected}")
+
 
 def run_distillation(args):
     """Main distillation training loop."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # 1. Load Data
-    os.makedirs(args.save_dir, exist_ok=True)
+    teacher_student_name = f"{args.teacher_model}_{args.student_model}"
+    RESULTS_BASE_DIR = os.path.join(RESULTS_ROOT, teacher_student_name)
+    os.makedirs(RESULTS_BASE_DIR, exist_ok=True)
+    logger.info(f"Results (models + metrics) will be saved under: {RESULTS_BASE_DIR}")
+
+    # 2. Load data
     train_loader, val_loader, _ = create_data_loaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         train_split=0.8,
         val_split=0.1,
         test_split=0.1,
-        num_workers=4
+        num_workers=4,
     )
-    logger.info(f"Data loaded: {len(train_loader.dataset)} training samples from {args.data_dir}")
+    logger.info(
+        f"Data loaded: {len(train_loader.dataset)} training samples from {args.data_dir}"
+    )
 
-    # 2. Load Models
-    # Load Teacher and set to evaluation mode
-    teacher_model = get_model(args.teacher_model, args.num_classes, pretrained=False).to(device)
+    # 3. Load teacher & student
+    teacher_model = get_model(
+        args.teacher_model,
+        args.num_classes,
+        pretrained=False,
+    ).to(device)
     load_checkpoint_flex(teacher_model, args.teacher_path, device)
     teacher_model.eval()
-    logger.info(f"Teacher model ({args.teacher_model}) loaded from {args.teacher_path}")
+    logger.info(
+        f"Teacher model ({args.teacher_model}) loaded from {args.teacher_path}"
+    )
 
-    # Load Student and set to training mode
-    student_model = get_model(args.student_model, args.num_classes, pretrained=True).to(device)
+    # Student (trainable)
+    student_model = get_model(
+        args.student_model,
+        args.num_classes,
+        pretrained=True,
+    ).to(device)
     student_model.train()
-    logger.info(f"Student model ({args.student_model}) loaded for training.")
+    logger.info(f"Student model ({args.student_model}) created for distillation.")
 
-    # 3. Setup Training
+    # 4. Setup KD training
     criterion = DistillationLoss(alpha=args.alpha, temperature=args.temperature)
     optimizer = optim.AdamW(student_model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=5, factor=0.5
+    )
 
-    # TRAINING LOOP ---
-    best_val_loss = float('inf')
-    for epoch in range(args.epochs):
-        student_model.train()
-        running_loss = 0.0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training]")
-        for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+    teacher_name_for_logging = args.teacher_model  # short name for run_name
 
-            with torch.no_grad():
-                teacher_logits = teacher_model(images)
-                
-            student_logits = student_model(images)
-            loss = criterion(student_logits, teacher_logits, labels)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-            
-        avg_train_loss = running_loss / len(train_loader)
-        
-        student_model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = student_model(images)
-                val_loss += F.cross_entropy(outputs, labels, reduction='sum').item()
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-
-        avg_val_loss = val_loss / len(val_loader.dataset)
-        val_accuracy = 100 * correct / total
-        
-        logger.info(f"Epoch {epoch+1} Summary: Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
-        
-        scheduler.step(avg_val_loss)
-        
-        # Save the best student model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            # Create a dynamic save path
-            teacher_name = os.path.splitext(os.path.basename(args.teacher_path))[0]
-            save_path = os.path.join(args.save_dir, f"student_{args.student_model}_from_teacher_{teacher_name}.pth")
-            torch.save(student_model.state_dict(), save_path)
-            logger.info(f"*** New best student model saved to {save_path} ***")
+    # 5. Train with KD + metrics
+    history, best_model_path, best_cm = train_kd(
+        student_model=student_model,
+        teacher_model=teacher_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=args.epochs,
+        save_dir=RESULTS_BASE_DIR, 
+        student_model_name=args.student_model,
+        teacher_name=teacher_name_for_logging,
+        num_classes=args.num_classes,
+    )
 
     logger.info("Distillation training complete.")
-    # Use the 'save_path' variable which holds the last best model path
-    if 'save_path' in locals():
-        logger.info(f"Final best student model is available at {save_path}")
+    if best_model_path is not None:
+        logger.info(f"Best student model saved at: {best_model_path}")
     else:
-        logger.warning("Training finished, but no model was saved (val loss may not have improved).")
+        logger.warning("Training finished, but no best model was saved (check logs).")
+
+    if best_cm is not None:
+        logger.info(f"Best validation confusion matrix:\n{best_cm}")
 
 
 if __name__ == "__main__":
@@ -138,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument("--teacher-path", type=str, required=True, help="Path to the trained teacher model .pth file")
     parser.add_argument("--student-model", type=str, required=True, help="Student model name (e.g., mobilenetv3)")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to the training/validation dataset")
-    parser.add_argument("--save-dir", type=str, default="distillation/saved_models", help="Directory to save student models")
+    parser.add_argument("--save-dir", type=str, default="Result/Distillation", help="Directory to save student models")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of classes (e.g., 4 for brain tumor)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
