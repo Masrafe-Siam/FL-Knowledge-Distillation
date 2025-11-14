@@ -71,7 +71,7 @@ def run_distillation(args):
         train_split=0.8,
         val_split=0.1,
         test_split=0.1,
-        num_workers=4,
+        num_workers=1,
     )
     logger.info(
         f"Data loaded: {len(train_loader.dataset)} training samples from {args.data_dir}"
