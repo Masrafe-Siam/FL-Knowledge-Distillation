@@ -138,9 +138,12 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             "num_clients": [],
             "client_data_sizes": [],
             "aggregation_time": [],
-            # ---- XAI history ----
+            # XAI history
             "xai_del_auc_mean": [], "xai_del_auc_std": [],
             "xai_heat_in_mask_mean": [], "xai_heat_in_mask_std": [],
+            # NEW: AUC history
+            "train_auc_roc_macro": [],
+            "val_auc_roc_macro": [],
         }
         self.best_accuracy = 0.0
         self.best_f1 = 0.0
@@ -245,6 +248,14 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         self.history["client_data_sizes"].append(summary["client_data_sizes"])
         self.history["aggregation_time"].append(time.time() - t0)
 
+        # AUC history (handles None safely)
+        self.history["train_auc_roc_macro"].append(
+            summary.get("train_auc_roc_macro_avg", np.nan)
+        )
+        self.history["val_auc_roc_macro"].append(
+            summary.get("val_auc_roc_macro_avg", np.nan)
+        )
+
         # XAI history (only if keys exist in summary)
         self.history["xai_del_auc_mean"].append(summary.get("xai_del_auc_mean_avg", np.nan))
         self.history["xai_del_auc_std"].append(summary.get("xai_del_auc_std_avg", np.nan))
@@ -298,6 +309,8 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         metric_keys = [
             "train_loss", "train_accuracy", "train_f1",
             "val_loss", "val_accuracy", "val_f1",
+            # NEW: per-client AUC metrics
+            "train_auc_roc_macro", "val_auc_roc_macro",
             "xai_del_auc_mean", "xai_del_auc_std",
             "xai_heat_in_mask_mean", "xai_heat_in_mask_std",
         ]
@@ -332,6 +345,10 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             "val_loss_avg": weighted_sums["val_loss"],
             "val_accuracy_avg": weighted_sums["val_accuracy"],
             "val_f1_avg": weighted_sums["val_f1"],
+            # NEW: aggregated AUC (or None if not present)
+            "train_auc_roc_macro_avg": weighted_sums["train_auc_roc_macro"] if present["train_auc_roc_macro"] else None,
+            "val_auc_roc_macro_avg": weighted_sums["val_auc_roc_macro"] if present["val_auc_roc_macro"] else None,
+
             "total_examples": total_examples,
             "client_data_sizes": client_data_sizes,
             "num_participating_clients": len(results),
@@ -381,6 +398,11 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             f"acc={summary['val_accuracy_avg']:.4f} f1={summary['val_f1_avg']:.4f}"
         )
         logger.info(f"Best : round={self.best_round} val_f1={self.best_f1:.4f} val_acc={self.best_accuracy:.4f}")
+        val_auc = summary.get("val_auc_roc_macro_avg", None)
+        if val_auc is not None:
+            logger.info(
+                f"Round {round_num}: val_auc_roc_macro={val_auc:.4f}"
+            )
 
         xai_mean = summary.get("xai_del_auc_mean_avg", None)
         if xai_mean is not None:
@@ -479,84 +501,138 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             logger.info(f"Final results saved in {self.results_base_dir}")
         except Exception as e:
             logger.error(f"Failed to save final results: {e}", exc_info=True)
-
     def plot_training_curves(self, save_suffix: str = ""):
         if not self.history["round"]:
             return
         rounds = self.history["round"]
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # --- Use 'ggplot' style for a different look ---
+        plt.style.use('ggplot')
+        plt.rcParams.update({
+            'font.size': 11,
+            'axes.facecolor': '#F3F3F3',
+            'figure.facecolor': 'white',
+            'axes.edgecolor': 'white',
+            'axes.grid': True,
+            'grid.color': 'white',
+            'grid.linestyle': '--',
+            'grid.linewidth': 1.5
+        })
 
-        # Loss
-        axes[0, 0].plot(rounds, self.history["train_loss"], label="Train Loss", linewidth=2, marker="o")
-        axes[0, 0].plot(rounds, self.history["val_loss"], label="Val Loss", linewidth=2, marker="s")
+        # --- PLOT 1: METRICS (Loss, Accuracy, F1, Aggregation Time) ---
+        fig1, axes1 = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # --- Loss Plot ---
+        ax = axes1[0, 0]
+        ax.plot(rounds, self.history["train_loss"], label="Train Loss", color='tab:blue', linestyle='-', marker="o", markersize=5)
+        ax.plot(rounds, self.history["val_loss"], label="Validation Loss", color='tab:orange', linestyle='--', marker="s", markersize=5)
         if self.history["test_loss"]:
-            # FIX: Slice the rounds to match the number of available test loss points
-            num_test_points = len(self.history["test_loss"])
-            axes[0, 0].plot(rounds[:num_test_points], self.history["test_loss"], label="Test Loss", linewidth=2, marker="^")
-        axes[0, 0].set_title("Loss")
+            ax.plot(rounds, self.history["test_loss"], label="Test Loss", color='tab:green', linestyle=':', marker="^", markersize=5)
+        ax.set_title("Loss Across Rounds", fontsize=15)
+        ax.set_xlabel("Federated Round", fontsize=12)
+        ax.set_ylabel("Loss Value", fontsize=12)
+        ax.legend(loc="upper right", fontsize=10)
 
-        # Acc
-        axes[0, 1].plot(rounds, self.history["train_accuracy"], label="Train Acc", linewidth=2, marker="o")
-        axes[0, 1].plot(rounds, self.history["val_accuracy"], label="Val Acc", linewidth=2, marker="s")
+        # --- Accuracy Plot ---
+        ax = axes1[0, 1]
+        ax.plot(rounds, self.history["train_accuracy"], label="Train Accuracy", color='tab:blue', linestyle='-', marker="o", markersize=5)
+        ax.plot(rounds, self.history["val_accuracy"], label="Validation Accuracy", color='tab:orange', linestyle='--', marker="s", markersize=5)
         if self.history["test_accuracy"]:
-            # FIX: Slice the rounds to match the number of available test accuracy points
-            num_test_points = len(self.history["test_accuracy"])
-            axes[0, 1].plot(rounds[:num_test_points], self.history["test_accuracy"], label="Test Acc", linewidth=2, marker="^")
-        axes[0, 1].set_title("Accuracy")
+            ax.plot(rounds, self.history["test_accuracy"], label="Test Accuracy", color='tab:green', linestyle=':', marker="^", markersize=5)
+        ax.set_title("Accuracy Across Rounds", fontsize=15)
+        ax.set_xlabel("Federated Round", fontsize=12)
+        ax.set_ylabel("Accuracy", fontsize=12)
+        ax.set_ylim(0, 1)
+        ax.legend(loc="lower right", fontsize=10)
 
-        # F1
-        axes[0, 2].plot(rounds, self.history["train_f1"], label="Train F1", linewidth=2, marker="o")
-        axes[0, 2].plot(rounds, self.history["val_f1"], label="Val F1", linewidth=2, marker="s")
+        # --- F1-Score Plot 
+        ax = axes1[1, 0]
+        ax.plot(rounds, self.history["train_f1"], label="Train F1-Score", color='tab:blue', linestyle='-', marker="o", markersize=5)
+        ax.plot(rounds, self.history["val_f1"], label="Validation F1-Score", color='tab:orange', linestyle='--', marker="s", markersize=5)
         if self.history["test_f1"]:
-            # FIX: Slice the rounds to match the number of available test F1 points
-            num_test_points = len(self.history["test_f1"])
-            axes[0, 2].plot(rounds[:num_test_points], self.history["test_f1"], label="Test F1", linewidth=2, marker="^")
-        axes[0, 2].set_title("F1-Score")
+            ax.plot(rounds, self.history["test_f1"], label="Test F1-Score", color='tab:green', linestyle=':', marker="^", markersize=5)
+        ax.set_title("F1-Score Across Rounds", fontsize=15)
+        ax.set_xlabel("Federated Round", fontsize=12)
+        ax.set_ylabel("F1-Score", fontsize=12)
+        ax.set_ylim(0, 1)
+        ax.legend(loc="lower right", fontsize=10)
 
-        # Clients per round
-        axes[1, 0].bar(rounds, self.history["num_clients"], alpha=0.8, label="Clients")
-        axes[1, 0].set_title("Clients per Round")
+        # After F1 plot
+        ax = axes1[1, 1]  # use the remaining subplot
+        if self.history["val_auc_roc_macro"]:
+            ax.plot(rounds, self.history["val_auc_roc_macro"], label="Val AUC (macro)", marker="o")
+        if self.history["train_auc_roc_macro"]:
+            ax.plot(rounds, self.history["train_auc_roc_macro"], label="Train AUC (macro)", linestyle="--", marker="s")
+        ax.set_title("AUC Across Rounds", fontsize=15)
+        ax.set_xlabel("Federated Round", fontsize=12)
+        ax.set_ylabel("AUC (macro-averaged)", fontsize=12)
+        ax.set_ylim(0, 1)
+        ax.legend(loc="lower right", fontsize=10)
 
-        # Aggregation time
+
+        # --- Aggregation Time Plot ---
+        ax = axes1[1, 1]
         if self.history["aggregation_time"]:
-            axes[1, 1].plot(rounds, self.history["aggregation_time"], linewidth=2, marker="d", label="Agg Time (s)")
-            axes[1, 1].set_title("Aggregation Time (s)")
+            ax.plot(rounds, self.history["aggregation_time"], color='tab:purple', linewidth=2, marker="d", markersize=5)
+            ax.set_title("Aggregation Time (seconds)", fontsize=15)
+            ax.set_xlabel("Federated Round", fontsize=12)
+            ax.set_ylabel("Time (s)", fontsize=12)
+        else:
+            ax.text(0.5, 0.5, 'No Aggregation Time Data', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes, c='gray')
+            ax.set_title("Aggregation Time (seconds)", fontsize=15)
+        
+        # --- Final Touches for Plot 1 ---
+        fig1.suptitle(f"Federated Learning Training Metrics ({self.model_name})", fontsize=20, y=1.03)
+        fig1.tight_layout(rect=[0, 0, 1, 0.98])
+        out1 = os.path.join(self.results_base_dir, f"training_metrics{save_suffix}.png")
+        fig1.savefig(out1, dpi=300, bbox_inches="tight")
+        plt.close(fig1)
+        logger.info(f"Saved plot 1 → {out1}")
 
-        # Data distribution (latest round)
+
+        # --- PLOT 2: CLIENT & DATA (Clients per Round, Data Distribution) ---
+        fig2, axes2 = plt.subplots(1, 2, figsize=(14, 7))
+
+        # --- Clients per Round (Bar Chart) ---
+        ax = axes2[0]
+        if self.history["num_clients"]:
+            ax.bar(rounds, self.history["num_clients"], alpha=0.8, color='tab:cyan')
+            ax.set_title("Number of Clients per Round", fontsize=15)
+            ax.set_xlabel("Federated Round", fontsize=12)
+            ax.set_ylabel("Number of Clients", fontsize=12)
+        else:
+            ax.text(0.5, 0.5, 'No Client Count Data', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes, c='gray')
+            ax.set_title("Number of Clients per Round", fontsize=15)
+            
+
+        # --- Data Distribution (Pie Chart) ---
+        ax = axes2[1]
         if self.history["client_data_sizes"]:
-            latest = self.history["client_data_sizes"][-1]
-            labels = [f"C{i+1}" for i in range(len(latest))]
-            axes[1, 2].pie(latest, labels=labels, autopct="%1.1f%%", startangle=90)
-            axes[1, 2].set_title("Data Distribution (latest)")
+            latest_data_sizes = self.history["client_data_sizes"][-1]
+            labels = [f"Client {i+1}" for i in range(len(latest_data_sizes))]
+            
+            # Use a different colormap for the pie
+            pie_colors = plt.cm.Pastel1(np.linspace(0, 1, len(labels)))
+            
+            ax.pie(latest_data_sizes, labels=labels, autopct="%1.1f%%", startangle=90, colors=pie_colors,
+                   wedgeprops={'edgecolor': 'white', 'linewidth': 1})
+            ax.set_title("Data Distribution (Latest Round)", fontsize=15)
+            ax.axis('equal')
+        else:
+            ax.text(0.5, 0.5, 'No Data Distribution Data', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes, c='gray')
+            ax.set_title("Data Distribution (Latest Round)", fontsize=15)
+            ax.axis('equal')
 
-        for ax in axes.ravel():
-            ax.grid(True, alpha=0.3)
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(loc="best")
+        # --- Final Touches for Plot 2 ---
+        fig2.suptitle(f"FL Client & Data Overview ({self.model_name})", fontsize=20, y=1.04)
+        fig2.tight_layout(rect=[0, 0, 1, 0.98])
+        out2 = os.path.join(self.results_base_dir, f"client_data_distribution{save_suffix}.png")
+        fig2.savefig(out2, dpi=300, bbox_inches="tight")
+        plt.close(fig2)
+        logger.info(f"Saved plot 2 → {out2}")
 
-        plt.tight_layout()
-        out = os.path.join(self.results_base_dir, f"training_curves{save_suffix}.png")
-        plt.savefig(out, dpi=300, bbox_inches="tight")
-        plt.close()
-        logger.info(f"Saved plot → {out}")
-
-    # def save_final_results(self):
-    #     # save_final_results logic
-    #     try:
-    #         with open(os.path.join(self.results_base_dir, "final_training_history.json"), "w") as f:
-    #             json.dump(self.history, f, indent=2)
-    #         self.plot_training_curves(save_suffix="_final")
-    #     except Exception as e: logger.error(f"Failed to save final results: {e}", exc_info=True)
-
-    # def plot_training_curves(self, save_suffix: str = ""):
-    #     # plot_training_curves logic
-    #     if not self.history["round"]: return
-    #     # (plotting logic...)
-    #     plt.figure()
-    #     plt.plot(self.history["round"], self.history["val_f1"], label="Val F1")
-    #     plt.savefig(os.path.join(self.results_base_dir, f"f1_curve{save_suffix}.png"))
-    #     plt.close()
+        # Reset style to default if other plots are made elsewhere
+        plt.style.use('default')
 
 
 # LoggingClientManager, start_waiting_heartbeat, create_server_strategy
