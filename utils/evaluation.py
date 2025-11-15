@@ -123,192 +123,361 @@ class ModelTrainer:
         self.writer = SummaryWriter(log_dir=log_dir)
         self.history = defaultdict(list)
 
-    def train_epoch(self, train_loader: DataLoader, optimizer: optim.Optimizer, 
-                   criterion: nn.Module, epoch: int) -> Dict:
-        """Train for one epoch"""
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: nn.Module,
+        epoch: int,
+    ) -> Dict:
+        """Train for one epoch and return metrics (loss, acc, F1, AUC, etc.)."""
 
         self.model.train()
         running_loss = 0.0
+
         all_predictions = []
         all_labels = []
         all_probabilities = []
 
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1} - Training')
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1} - Training")
 
         for batch_idx, (data, target) in enumerate(progress_bar):
             data, target = data.to(self.device), target.to(self.device)
 
             optimizer.zero_grad()
-            outputs = self.model(data)  
+            outputs = self.model(data)
             loss = criterion(outputs, target)
             loss.backward()
 
+            # gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # Statistics
+            # accumulate loss
             running_loss += loss.item()
+
+            # predictions and probabilities
             probabilities = torch.softmax(outputs, dim=1)
             _, predicted = torch.max(outputs.data, 1)
 
             all_predictions.extend(predicted.cpu().numpy())
             all_labels.extend(target.cpu().numpy())
-            all_probabilities.extend(probabilities.cpu().detach().numpy())
+            all_probabilities.extend(probabilities.detach().cpu().numpy())
 
-            # Update progress bar
-            progress_bar.set_postfix({'Loss': loss.item()})
-            
-            # Log to tensorboard
+            # TensorBoard: per-batch loss
             global_step = epoch * len(train_loader) + batch_idx
-            self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+            self.writer.add_scalar("Train/BatchLoss", loss.item(), global_step)
 
-        # Calculate epoch metrics - Fixed: was running_loss / (train_loader)
+            # tqdm bar
+            progress_bar.set_postfix({"Loss": loss.item()})
+
+        # ---- aggregate epoch metrics ----
         avg_loss = running_loss / len(train_loader)
-        metrics = self.metrics_calculator.calculate_metrics( 
-            np.array(all_labels), 
-            np.array(all_predictions), 
-            np.array(all_probabilities)
+
+        metrics = self.metrics_calculator.calculate_metrics(
+            np.array(all_labels),
+            np.array(all_predictions),
+            np.array(all_probabilities),
         )
-        metrics['loss'] = avg_loss
+        metrics["loss"] = avg_loss  # add loss explicitly
+
         return metrics
 
-    def validate_epoch(self, val_loader: DataLoader, criterion: nn.Module, epoch: int) -> Dict:
+    def validate_epoch(
+        self,
+        val_loader: DataLoader,
+        criterion: nn.Module,
+        epoch: int,
+    ) -> Dict:
+        """Run validation for one epoch and return metrics (loss, acc, F1, AUC, etc.)."""
+
         self.model.eval()
-        
         running_loss = 0.0
+
         all_predictions = []
         all_labels = []
         all_probabilities = []
-        
+
+        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1} - Validation")
+
         with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc=f'Epoch {epoch+1} - Validation')
-            
-            for data, target in progress_bar:
+            for batch_idx, (data, target) in enumerate(progress_bar):
                 data, target = data.to(self.device), target.to(self.device)
-                
+
                 outputs = self.model(data)
                 loss = criterion(outputs, target)
-                
+
                 running_loss += loss.item()
+
                 probabilities = torch.softmax(outputs, dim=1)
                 _, predicted = torch.max(outputs.data, 1)
-                
+
                 all_predictions.extend(predicted.cpu().numpy())
                 all_labels.extend(target.cpu().numpy())
-                all_probabilities.extend(probabilities.cpu().detach().numpy())
-                
-                progress_bar.set_postfix({'Loss': loss.item()})
-        
-        # Calculate epoch metrics
+                all_probabilities.extend(probabilities.detach().cpu().numpy())
+
+                progress_bar.set_postfix({"Loss": loss.item()})
+
         avg_loss = running_loss / len(val_loader)
+
         metrics = self.metrics_calculator.calculate_metrics(
-            np.array(all_labels), 
+            np.array(all_labels),
             np.array(all_predictions),
-            np.array(all_probabilities)
+            np.array(all_probabilities),
         )
-        metrics['loss'] = avg_loss
-        
+        metrics["loss"] = avg_loss
+
+        # TensorBoard: per-epoch val metrics
+        self.writer.add_scalar("Val/Loss", metrics["loss"], epoch)
+        self.writer.add_scalar("Val/Accuracy", metrics["accuracy"], epoch)
+        if "f1_macro" in metrics:
+            self.writer.add_scalar("Val/F1_macro", metrics["f1_macro"], epoch)
+        if "auc_roc_macro" in metrics:
+            self.writer.add_scalar("Val/AUC_ROC_macro", metrics["auc_roc_macro"], epoch)
+        elif "auc_roc" in metrics:
+            self.writer.add_scalar("Val/AUC_ROC", metrics["auc_roc"], epoch)
+
         return metrics
 
-    def train(self, train_loader: DataLoader, val_loader: DataLoader, 
-          num_epochs: int, learning_rate: float = 0.001,
-          weight_decay: float = 1e-4, class_weights: Optional[torch.Tensor] = None,
-          use_scheduler: bool = True, patience: int = 5,
-          criterion: Optional[nn.Module] = None,
-          optimizer_name: str = 'adamw',
-          scheduler_name: str = 'plateau') -> Dict:
-        
-        optimizer = get_optimizer(self.model, optimizer_name, learning_rate, weight_decay)
 
+    # def train(self, train_loader: DataLoader, val_loader: DataLoader, 
+    #       num_epochs: int, learning_rate: float = 0.001,
+    #       weight_decay: float = 1e-4, class_weights: Optional[torch.Tensor] = None,
+    #       use_scheduler: bool = True, patience: int = 5,
+    #       criterion: Optional[nn.Module] = None,
+    #       optimizer_name: str = 'adamw',
+    #       scheduler_name: str = 'plateau') -> Dict:
+        
+    #     optimizer = get_optimizer(self.model, optimizer_name, learning_rate, weight_decay)
+
+    #     if use_scheduler:
+    #         scheduler = get_scheduler(optimizer, scheduler_name)
+
+    #     #Loss Function
+    #     if criterion is None:
+    #         if class_weights is not None:
+    #             criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+    #         else:
+    #             criterion = nn.CrossEntropyLoss()
+
+    #     best_val_loss = float('inf')
+    #     best_model_state = None
+    #     early_stopping = EarlyStopping(patience=patience, mode='min')
+
+    #     logger.info(f"Starting training loop with optimizer={optimizer_name}, scheduler={scheduler_name if use_scheduler else 'None'}")
+
+    #     total_loss = 0.0
+    #     total_samples = 0
+    #     correct_predictions = 0
+
+    #     for epoch in range(num_epochs):
+    #         self.model.train()
+    #         epoch_loss = 0.0
+    #         epoch_samples = 0
+    #         epoch_correct = 0
+
+    #         for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} - Training")):
+    #             data, target = data.to(self.device), target.to(self.device)
+
+    #             optimizer.zero_grad()
+    #             outputs = self.model(data)
+    #             loss = criterion(outputs, target)
+    #             loss.backward()
+    #             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+    #             optimizer.step()
+
+    #             epoch_loss += loss.item()
+    #             epoch_samples += data.size(0)
+    #             _, predicted = torch.max(outputs.data, 1)
+    #             epoch_correct += (predicted == target).sum().item()
+
+    #             global_step = epoch * len(train_loader) + batch_idx
+    #             self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+
+    #         avg_epoch_loss = epoch_loss / len(train_loader)
+    #         epoch_accuracy = epoch_correct / epoch_samples
+
+    #         #Validation
+    #         val_metrics = self.validate_epoch(val_loader, criterion, epoch)
+    #         val_loss = val_metrics['loss']
+
+    #         #Scheduler Step
+    #         if use_scheduler:
+    #             if scheduler_name.lower() == 'plateau':
+    #                 scheduler.step(val_loss)
+    #             else:
+    #                 scheduler.step()
+
+    #         logger.info(
+    #             f"Epoch {epoch+1}/{num_epochs} | "
+    #             f"Train Loss: {avg_epoch_loss:.4f}, Train Acc: {epoch_accuracy:.4f} | "
+    #             f"Val Loss: {val_loss:.4f}, Val Acc: {val_metrics['accuracy']:.4f} | "
+    #             f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+    #         )
+
+    #         self._log_epoch_metrics(epoch, {
+    #             'loss': avg_epoch_loss,
+    #             'accuracy': epoch_accuracy
+    #         }, val_metrics)
+
+    #         self.history['train_loss'].append(avg_epoch_loss)
+    #         self.history['train_accuracy'].append(epoch_accuracy)
+    #         self.history['val_loss'].append(val_loss)
+    #         self.history['val_accuracy'].append(val_metrics['accuracy'])
+    #         self.history['val_f1_macro'].append(val_metrics['f1_macro'])
+
+    #         #Best Model Checkpoint
+    #         if val_loss < best_val_loss:
+    #             best_val_loss = val_loss
+    #             best_model_state = self.model.state_dict()
+    #             self.save_checkpoint(epoch, {'loss': avg_epoch_loss, 'accuracy': epoch_accuracy}, val_metrics, is_best=True)
+    #         elif early_stopping(val_loss):
+    #             logger.info(f"Early stopping triggered at epoch {epoch+1}")
+    #             break
+
+    #         total_loss += epoch_loss
+    #         total_samples += epoch_samples
+    #         correct_predictions += epoch_correct
+
+    #     if best_model_state is not None:
+    #         self.model.load_state_dict(best_model_state)
+    #         logger.info("Best model weights loaded.")
+
+    #     logger.info("Training loop completed.")
+    #     self.writer.close()
+
+    #     self.plot_training_history(metrics=['loss'], save_path=os.path.join(self.save_dir, 'loss_curve.png'))
+    #     self.plot_training_history(metrics=['accuracy'], save_path=os.path.join(self.save_dir, 'accuracy_curve.png'))
+
+    #     return self.history
+
+    def train(
+        self,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        num_epochs: int,
+        learning_rate: float = 0.001,
+        weight_decay: float = 1e-4,
+        class_weights: Optional[torch.Tensor] = None,
+        use_scheduler: bool = True,
+        patience: int = 5,
+        criterion: Optional[nn.Module] = None,
+        optimizer_name: str = "adamw",
+        scheduler_name: str = "plateau",
+    ) -> Dict:
+        """
+        Full training loop:
+        - uses train_epoch / validate_epoch (which compute AUC via y_probs)
+        - tracks train/val loss, accuracy, F1, and AUC
+        - early stopping on validation loss
+        """
+
+        # Optimizer & scheduler
+        optimizer = get_optimizer(
+            self.model,
+            optimizer_name=optimizer_name,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        scheduler = None
         if use_scheduler:
             scheduler = get_scheduler(optimizer, scheduler_name)
 
-        #Loss Function
+        # Loss function
         if criterion is None:
             if class_weights is not None:
                 criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
             else:
                 criterion = nn.CrossEntropyLoss()
 
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
         best_model_state = None
-        early_stopping = EarlyStopping(patience=patience, mode='min')
+        early_stopping = EarlyStopping(patience=patience, mode="min")
 
-        logger.info(f"Starting training loop with optimizer={optimizer_name}, scheduler={scheduler_name if use_scheduler else 'None'}")
-
-        total_loss = 0.0
-        total_samples = 0
-        correct_predictions = 0
+        logger.info(
+            f"Starting training loop with optimizer={optimizer_name}, "
+            f"scheduler={scheduler_name if use_scheduler else 'None'}"
+        )
 
         for epoch in range(num_epochs):
-            self.model.train()
-            epoch_loss = 0.0
-            epoch_samples = 0
-            epoch_correct = 0
+            # 1) TRAIN ONE EPOCH (returns metrics incl. AUC if possible) ----
+            train_metrics = self.train_epoch(
+                train_loader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                epoch=epoch,
+            )
 
-            for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} - Training")):
-                data, target = data.to(self.device), target.to(self.device)
+            # 2) VALIDATION EPOCH (returns metrics incl. AUC if possible) ----
+            val_metrics = self.validate_epoch(
+                val_loader=val_loader,
+                criterion=criterion,
+                epoch=epoch,
+            )
 
-                optimizer.zero_grad()
-                outputs = self.model(data)
-                loss = criterion(outputs, target)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                epoch_samples += data.size(0)
-                _, predicted = torch.max(outputs.data, 1)
-                epoch_correct += (predicted == target).sum().item()
-
-                global_step = epoch * len(train_loader) + batch_idx
-                self.writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
-
-            avg_epoch_loss = epoch_loss / len(train_loader)
-            epoch_accuracy = epoch_correct / epoch_samples
-
-            #Validation
-            val_metrics = self.validate_epoch(val_loader, criterion, epoch)
-            val_loss = val_metrics['loss']
-
-            #Scheduler Step
-            if use_scheduler:
-                if scheduler_name.lower() == 'plateau':
-                    scheduler.step(val_loss)
+            # 3) Step scheduler ----
+            if use_scheduler and scheduler is not None:
+                if scheduler_name.lower() == "plateau":
+                    scheduler.step(val_metrics["loss"])
                 else:
                     scheduler.step()
 
+            # 4) Log to console (with LR) ----
+            current_lr = optimizer.param_groups[0]["lr"]
             logger.info(
                 f"Epoch {epoch+1}/{num_epochs} | "
-                f"Train Loss: {avg_epoch_loss:.4f}, Train Acc: {epoch_accuracy:.4f} | "
-                f"Val Loss: {val_loss:.4f}, Val Acc: {val_metrics['accuracy']:.4f} | "
-                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+                f"Train Loss: {train_metrics['loss']:.4f}, "
+                f"Train Acc: {train_metrics['accuracy']:.4f} | "
+                f"Val Loss: {val_metrics['loss']:.4f}, "
+                f"Val Acc: {val_metrics['accuracy']:.4f} | "
+                f"LR: {current_lr:.6f}"
             )
 
-            self._log_epoch_metrics(epoch, {
-                'loss': avg_epoch_loss,
-                'accuracy': epoch_accuracy
-            }, val_metrics)
+            # Also send all scalar metrics to TensorBoard
+            self._log_epoch_metrics(epoch, train_metrics, val_metrics)
 
-            self.history['train_loss'].append(avg_epoch_loss)
-            self.history['train_accuracy'].append(epoch_accuracy)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_accuracy'].append(val_metrics['accuracy'])
-            self.history['val_f1_macro'].append(val_metrics['f1_macro'])
+            # 5) Update history (loss, acc, F1, AUC) ----
+            # Train
+            self.history["train_loss"].append(train_metrics["loss"])
+            self.history["train_accuracy"].append(train_metrics["accuracy"])
+            if "f1_macro" in train_metrics:
+                self.history["train_f1_macro"].append(train_metrics["f1_macro"])
+            # Training AUC (binary or multi-class)
+            if "auc_roc_macro" in train_metrics:
+                self.history["train_auc_roc_macro"].append(train_metrics["auc_roc_macro"])
+            elif "auc_roc" in train_metrics:
+                self.history["train_auc_roc"].append(train_metrics["auc_roc"])
 
-            #Best Model Checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = self.model.state_dict()
-                self.save_checkpoint(epoch, {'loss': avg_epoch_loss, 'accuracy': epoch_accuracy}, val_metrics, is_best=True)
-            elif early_stopping(val_loss):
+            # Val
+            self.history["val_loss"].append(val_metrics["loss"])
+            self.history["val_accuracy"].append(val_metrics["accuracy"])
+            if "f1_macro" in val_metrics:
+                self.history["val_f1_macro"].append(val_metrics["f1_macro"])
+            # Validation AUC
+            if "auc_roc_macro" in val_metrics:
+                self.history["val_auc_roc_macro"].append(val_metrics["auc_roc_macro"])
+            elif "auc_roc" in val_metrics:
+                self.history["val_auc_roc"].append(val_metrics["auc_roc"])
+
+            # 6) Best model & early stopping (based on val loss) ----
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                # clone weights so they are not modified by later training
+                best_model_state = {
+                    k: v.detach().clone() for k, v in self.model.state_dict().items()
+                }
+                self.save_checkpoint(
+                    epoch,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    is_best=True,
+                )
+            elif early_stopping(val_metrics["loss"]):
                 logger.info(f"Early stopping triggered at epoch {epoch+1}")
                 break
 
-            total_loss += epoch_loss
-            total_samples += epoch_samples
-            correct_predictions += epoch_correct
-
+        # 7) Restore best model weights ----
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
             logger.info("Best model weights loaded.")
@@ -316,10 +485,33 @@ class ModelTrainer:
         logger.info("Training loop completed.")
         self.writer.close()
 
-        self.plot_training_history(metrics=['loss'], save_path=os.path.join(self.save_dir, 'loss_curve.png'))
-        self.plot_training_history(metrics=['accuracy'], save_path=os.path.join(self.save_dir, 'accuracy_curve.png'))
+        # 8) Plot curves (loss, acc, and AUC if available) ----
+        self.plot_training_history(
+            metrics=["loss"],
+            save_path=os.path.join(self.save_dir, "loss_curve.png"),
+        )
+        self.plot_training_history(
+            metrics=["accuracy"],
+            save_path=os.path.join(self.save_dir, "accuracy_curve.png"),
+        )
+
+        # AUC curves (multi-class or binary)
+        if (
+            "train_auc_roc_macro" in self.history
+            and "val_auc_roc_macro" in self.history
+        ):
+            self.plot_training_history(
+                metrics=["auc_roc_macro"],
+                save_path=os.path.join(self.save_dir, "auc_roc_macro_curve.png"),
+            )
+        elif "train_auc_roc" in self.history and "val_auc_roc" in self.history:
+            self.plot_training_history(
+                metrics=["auc_roc"],
+                save_path=os.path.join(self.save_dir, "auc_roc_curve.png"),
+            )
 
         return self.history
+
 
 
     def evaluate(self, test_loader: DataLoader) -> Dict:
@@ -441,6 +633,7 @@ class ModelTrainer:
         logger.info(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
         logger.info(f"  Val Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
         logger.info(f"  Val F1: {val_metrics['f1_macro']:.4f}")
+        logger.info("   val AUC-ROC: {:.4f}".format(val_metrics.get('auc_roc_macro', val_metrics.get('auc_roc', 0.0))))
     
     def _generate_classification_report(self, metrics: Dict):
         """Generate and save detailed classification report"""

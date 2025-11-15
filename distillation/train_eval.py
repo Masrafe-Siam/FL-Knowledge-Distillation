@@ -1298,7 +1298,7 @@ def train_kd(
             best_model_path = os.path.join(save_dir, f"{run_name}.pth")
             torch.save(student_model.state_dict(), best_model_path)
             best_cm = cm
-            logger.info(f"*** New best student model saved to {best_model_path} ***")
+            logger.info(f"New best student model saved to {best_model_path}")
 
     # After all epochs, plot curves and save confusion matrix
     # metrics_dir is already defined and created
