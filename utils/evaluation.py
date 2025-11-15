@@ -633,7 +633,7 @@ class ModelTrainer:
         logger.info(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
         logger.info(f"  Val Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
         logger.info(f"  Val F1: {val_metrics['f1_macro']:.4f}")
-        logger.info("val AUC-ROC: {:.4f}".format(val_metrics.get('auc_roc_macro', val_metrics.get('auc_roc', 0.0))))
+        logger.info("   val AUC-ROC: {:.4f}".format(val_metrics.get('auc_roc_macro', val_metrics.get('auc_roc', 0.0))))
     
     def _generate_classification_report(self, metrics: Dict):
         """Generate and save detailed classification report"""

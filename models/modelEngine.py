@@ -7,6 +7,7 @@ from models.cnn import CustomCNN
 from models.mobilenetv3 import MobileNetV3
 from models.denseNet121 import DenseNet121Medical
 from models.HybridSwinDenseNetMLP import HybridSwinDenseNetMLP
+from models.efficientnet_medical import EfficientNetB3Medical, EfficientNetB4Medical
 
 
 def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropout_rate: float = 0.5):
@@ -38,6 +39,19 @@ def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropou
             dropout=dropout_rate,
             freeze_backbones=False
         )
+    elif model_name == 'effnetb3':
+        model = EfficientNetB3Medical(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate
+        )
+    elif model_name == 'effnetb4':
+        model = EfficientNetB4Medical(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate
+        )
+
 
     else:
         raise ValueError(f"Model '{model_name}' is not supported.")

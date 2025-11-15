@@ -506,7 +506,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             return
         rounds = self.history["round"]
         
-        # --- Use 'ggplot' style for a different look ---
+        # Use 'ggplot' style for a different look
         plt.style.use('ggplot')
         plt.rcParams.update({
             'font.size': 11,
@@ -519,10 +519,10 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             'grid.linewidth': 1.5
         })
 
-        # --- PLOT 1: METRICS (Loss, Accuracy, F1, Aggregation Time) ---
+        # PLOT 1: METRICS (Loss, Accuracy, F1, Aggregation Time)
         fig1, axes1 = plt.subplots(2, 2, figsize=(16, 12))
         
-        # --- Loss Plot ---
+        # Loss Plot
         ax = axes1[0, 0]
         ax.plot(rounds, self.history["train_loss"], label="Train Loss", color='tab:blue', linestyle='-', marker="o", markersize=5)
         ax.plot(rounds, self.history["val_loss"], label="Validation Loss", color='tab:orange', linestyle='--', marker="s", markersize=5)
@@ -533,7 +533,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         ax.set_ylabel("Loss Value", fontsize=12)
         ax.legend(loc="upper right", fontsize=10)
 
-        # --- Accuracy Plot ---
+        # Accuracy Plot
         ax = axes1[0, 1]
         ax.plot(rounds, self.history["train_accuracy"], label="Train Accuracy", color='tab:blue', linestyle='-', marker="o", markersize=5)
         ax.plot(rounds, self.history["val_accuracy"], label="Validation Accuracy", color='tab:orange', linestyle='--', marker="s", markersize=5)
@@ -545,7 +545,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         ax.set_ylim(0, 1)
         ax.legend(loc="lower right", fontsize=10)
 
-        # --- F1-Score Plot 
+        # F1-Score Plot 
         ax = axes1[1, 0]
         ax.plot(rounds, self.history["train_f1"], label="Train F1-Score", color='tab:blue', linestyle='-', marker="o", markersize=5)
         ax.plot(rounds, self.history["val_f1"], label="Validation F1-Score", color='tab:orange', linestyle='--', marker="s", markersize=5)
@@ -570,7 +570,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         ax.legend(loc="lower right", fontsize=10)
 
 
-        # --- Aggregation Time Plot ---
+        # Aggregation Time Plot
         ax = axes1[1, 1]
         if self.history["aggregation_time"]:
             ax.plot(rounds, self.history["aggregation_time"], color='tab:purple', linewidth=2, marker="d", markersize=5)
@@ -581,7 +581,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             ax.text(0.5, 0.5, 'No Aggregation Time Data', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes, c='gray')
             ax.set_title("Aggregation Time (seconds)", fontsize=15)
         
-        # --- Final Touches for Plot 1 ---
+        # Final Touches for Plot 1
         fig1.suptitle(f"Federated Learning Training Metrics ({self.model_name})", fontsize=20, y=1.03)
         fig1.tight_layout(rect=[0, 0, 1, 0.98])
         out1 = os.path.join(self.results_base_dir, f"training_metrics{save_suffix}.png")
@@ -590,10 +590,10 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
         logger.info(f"Saved plot 1 → {out1}")
 
 
-        # --- PLOT 2: CLIENT & DATA (Clients per Round, Data Distribution) ---
+        # PLOT 2: CLIENT & DATA (Clients per Round, Data Distribution)
         fig2, axes2 = plt.subplots(1, 2, figsize=(14, 7))
 
-        # --- Clients per Round (Bar Chart) ---
+        # Clients per Round (Bar Chart)
         ax = axes2[0]
         if self.history["num_clients"]:
             ax.bar(rounds, self.history["num_clients"], alpha=0.8, color='tab:cyan')
@@ -605,7 +605,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             ax.set_title("Number of Clients per Round", fontsize=15)
             
 
-        # --- Data Distribution (Pie Chart) ---
+        # Data Distribution (Pie Chart)
         ax = axes2[1]
         if self.history["client_data_sizes"]:
             latest_data_sizes = self.history["client_data_sizes"][-1]
@@ -623,7 +623,7 @@ class MedicalFLStrategy(fl.server.strategy.FedAvg):
             ax.set_title("Data Distribution (Latest Round)", fontsize=15)
             ax.axis('equal')
 
-        # --- Final Touches for Plot 2 ---
+        # Final Touches for Plot 2
         fig2.suptitle(f"FL Client & Data Overview ({self.model_name})", fontsize=20, y=1.04)
         fig2.tight_layout(rect=[0, 0, 1, 0.98])
         out2 = os.path.join(self.results_base_dir, f"client_data_distribution{save_suffix}.png")
@@ -701,7 +701,8 @@ def main():
     parser.add_argument("--fraction-fit", type=float, default=1.0)
     parser.add_argument("--fraction-evaluate", type=float, default=1.0)
     parser.add_argument("--model", type=str, default="densenet121", 
-                        choices=["mobilenetv3", "hybridmodel", "resnet50", "cnn", "hybridswin", "densenet121"], help="Teacher model architecture")
+                        choices=["mobilenetv3", "hybridmodel", 
+                                 "resnet50", "cnn", "hybridswin", "densenet121", "effnetb3", "effnetb4"], help="Teacher model architecture")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of classes")
     parser.add_argument("--local-epochs", type=int, default=6)
     
