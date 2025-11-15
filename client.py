@@ -149,7 +149,7 @@ class MedicalFLClient(fl.client.NumPyClient):
         num_classes: int = 4,
         batch_size: int = 16,
         local_epochs: int = 8,
-        num_workers: int = 4,
+        num_workers: int = 1,
         results_base_dir: str = RESULTS_BASE_DIR,
     ):
         self.client_id = client_id
@@ -323,6 +323,10 @@ class MedicalFLClient(fl.client.NumPyClient):
             "val_loss": float(train_history["val_loss"][-1]),
             "val_accuracy": float(train_history["val_accuracy"][-1]),
             "val_f1": float(train_history["val_f1_macro"][-1]),
+
+            "train_auc_roc_macro": float(train_history.get("train_auc_roc_macro", [0.0])[-1]),
+            "val_auc_roc_macro": float(train_history.get("val_auc_roc_macro", [0.0])[-1]),
+
             "test_accuracy": float(test_metrics["accuracy"]),
             "test_f1": float(test_metrics["f1_macro"]),
             "num_examples": int(len(self.train_loader.dataset)),
