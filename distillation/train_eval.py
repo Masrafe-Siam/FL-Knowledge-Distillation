@@ -1,19 +1,274 @@
 # import os
 # import logging
+# import math
 # from typing import Dict, Tuple, List
 
+# import numpy as np
 # import torch
 # import torch.nn.functional as F
 # from tqdm import tqdm
 # from sklearn.metrics import confusion_matrix, roc_auc_score
 # import matplotlib.pyplot as plt
 
-
 # logger = logging.getLogger("KDTrainEval")
-# RESULTS_BASE_DIR = os.path.abspath("Result/Distillation")
+
 
 # def _ensure_dir(path: str) -> None:
 #     os.makedirs(path, exist_ok=True)
+
+
+# def find_last_conv_layer(model: torch.nn.Module):
+#     """Return the last nn.Conv2d layer in the model, or None if not found."""
+#     last_conv = None
+#     for module in model.modules():
+#         if isinstance(module, torch.nn.Conv2d):
+#             last_conv = module
+#     if last_conv is None:
+#         logger.warning("No Conv2d layer found for Grad-CAM++; XAI will be skipped.")
+#     return last_conv
+
+
+# def compute_gradcam_pp(
+#     model: torch.nn.Module,
+#     x: torch.Tensor,
+#     target_layer: torch.nn.Module,
+#     class_idx: int = None,
+# ) -> np.ndarray:
+#     """
+#     Compute Grad-CAM++ heatmap for a single image batch x (shape [1, C, H, W]).
+#     Returns a numpy array of shape [H, W] normalized to [0,1].
+#     """
+#     activations: List[torch.Tensor] = []
+#     gradients: List[torch.Tensor] = []
+
+#     def forward_hook(module, inp, out):
+#         activations.append(out)
+
+#     def backward_hook(module, grad_in, grad_out):
+#         # grad_out is a tuple; we need the gradient w.r.t. activations
+#         gradients.append(grad_out[0])
+
+#     handle_f = target_layer.register_forward_hook(forward_hook)
+#     handle_b = target_layer.register_backward_hook(backward_hook)
+
+#     model.zero_grad()
+#     logits = model(x)
+#     if class_idx is None:
+#         class_idx = int(torch.argmax(logits, dim=1).item())
+#     score = logits[:, class_idx]
+#     score.backward(retain_graph=False)
+
+#     A = activations[0]  # [B, C, H, W]
+#     G = gradients[0]    # [B, C, H, W]
+
+#     # Use only first element in batch (we expect B=1 here)
+#     A = A[0]  # [C, H, W]
+#     G = G[0]  # [C, H, W]
+
+#     grads2 = G ** 2
+#     grads3 = G ** 3
+#     sum_activations = torch.sum(A, dim=(1, 2), keepdim=True)  # [C, 1, 1]
+
+#     eps = 1e-7
+#     alpha = grads2 / (2 * grads2 + sum_activations * grads3 + eps)  # [C, H, W]
+#     positive_gradients = F.relu(G)  # [C, H, W]
+#     weights = torch.sum(alpha * positive_gradients, dim=(1, 2))  # [C]
+
+#     cam = torch.sum(weights.view(-1, 1, 1) * A, dim=0)  # [H, W]
+#     cam = F.relu(cam)
+
+#     cam_np = cam.detach().cpu().numpy()
+#     cam_np = cam_np - cam_np.min()
+#     if cam_np.max() > 0:
+#         cam_np = cam_np / cam_np.max()
+
+#     handle_f.remove()
+#     handle_b.remove()
+#     return cam_np
+
+
+# def compute_deletion_auc(
+#     model: torch.nn.Module,
+#     x: torch.Tensor,
+#     cam: np.ndarray,
+#     class_idx: int,
+#     device: torch.device,
+#     steps: int = 10,
+# ) -> float:
+#     """
+#     Deletion AUC faithfulness metric.
+#     Iteratively removes the most important pixels according to cam and tracks
+#     the predicted probability for class_idx. Returns the AUC over fraction deleted.
+#     """
+#     model.eval()
+#     with torch.no_grad():
+#         x_mod = x.clone().to(device)  # [1, C, H, W]
+#         _, _, H, W = x_mod.shape
+
+#         # flatten CAM and sort pixels by importance (descending)
+#         cam_flat = cam.reshape(-1)
+#         indices = np.argsort(-cam_flat)  # high to low
+#         num_pixels = H * W
+#         pixels_per_step = max(num_pixels // steps, 1)
+
+#         scores: List[float] = []
+#         # mask initialized to ones; will zero-out important pixels progressively
+#         mask = torch.ones((1, 1, H, W), device=device)
+
+#         for i in range(steps + 1):
+#             logits = model(x_mod * mask)
+#             probs = F.softmax(logits, dim=1)
+#             scores.append(float(probs[0, class_idx].item()))
+
+#             if i == steps:
+#                 break
+
+#             start = i * pixels_per_step
+#             end = (i + 1) * pixels_per_step
+#             end = min(end, num_pixels)
+#             idx = indices[start:end]
+
+#             # update mask: zero out newly selected pixels
+#             flat_mask = mask.view(-1)
+#             flat_mask[idx] = 0.0
+#             mask = flat_mask.view(1, 1, H, W)
+
+#         fractions = np.linspace(0.0, 1.0, len(scores))
+#         auc = float(np.trapz(scores, fractions))
+#         return auc
+
+
+# def save_gradcam_overlay(
+#     x: torch.Tensor,
+#     cam: np.ndarray,
+#     out_dir: str,
+#     epoch: int,
+#     idx: int,
+#     true_label: int,
+#     pred_label: int,
+# ) -> None:
+#     """
+#     Save an overlay of Grad-CAM++ heatmap on top of the input image.
+#     x: [1, C, H, W] tensor on device.
+#     """
+#     _ensure_dir(out_dir)
+
+#     img = x[0].detach().cpu()
+#     if img.shape[0] == 1:
+#         base = img[0].numpy()
+#     else:
+#         base = img.permute(1, 2, 0).numpy()
+
+#     base = base - base.min()
+#     if base.max() > 0:
+#         base = base / (base.max() + 1e-8)
+
+#     cam_norm = cam
+#     cam_norm = cam_norm - cam_norm.min()
+#     if cam_norm.max() > 0:
+#         cam_norm = cam_norm / (cam_norm.max() + 1e-8)
+
+#     plt.figure(figsize=(4, 4))
+#     if base.ndim == 2:
+#         plt.imshow(base, cmap="gray")
+#     else:
+#         plt.imshow(base)
+#     plt.imshow(cam_norm, cmap="jet", alpha=0.5)
+#     plt.axis("off")
+
+#     fname = f"epoch{epoch}_idx{idx}_true{true_label}_pred{pred_label}.png"
+#     save_path = os.path.join(out_dir, fname)
+#     plt.savefig(save_path, bbox_inches="tight", pad_inches=0.0)
+#     plt.close()
+#     logger.info(f"Saved Grad-CAM++ overlay to {save_path}")
+
+
+# def run_xai_probe_gradcam_pp(
+#     model: torch.nn.Module,
+#     val_loader,
+#     device: torch.device,
+#     target_layer: torch.nn.Module,
+#     num_classes: int,
+#     save_dir: str,
+#     epoch: int,
+#     num_samples: int = 16,
+#     save_k: int = 4,
+# ) -> Dict[str, float]:
+#     """
+#     Run a Grad-CAM++ + Deletion AUC probe on a subset of the validation set.
+#     Returns:
+#         {"val_del_auc_mean": ..., "val_del_auc_std": ...}
+#     """
+#     if target_layer is None:
+#         return {"val_del_auc_mean": float("nan"), "val_del_auc_std": float("nan")}
+
+#     model.eval()
+#     del_aucs: List[float] = []
+#     seen = 0
+#     saved = 0
+
+#     xai_dir = os.path.join(save_dir, "xai")
+#     _ensure_dir(xai_dir)
+
+#     for images, labels in val_loader:
+#         images = images.to(device)
+#         labels = labels.to(device)
+#         batch_size = images.size(0)
+
+#         for i in range(batch_size):
+#             if seen >= num_samples:
+#                 break
+
+#             x = images[i:i+1]
+#             y_true = int(labels[i].item())
+
+#             with torch.no_grad():
+#                 logits = model(x)
+#                 pred_idx = int(torch.argmax(logits, dim=1).item())
+
+#             # for deletion we can use the true label if in range, else pred
+#             class_idx = y_true if 0 <= y_true < num_classes else pred_idx
+
+#             # Grad-CAM++ heatmap
+#             cam = compute_gradcam_pp(model, x, target_layer, class_idx=class_idx)
+
+#             # Deletion-AUC
+#             del_auc = compute_deletion_auc(
+#                 model=model,
+#                 x=x,
+#                 cam=cam,
+#                 class_idx=class_idx,
+#                 device=device,
+#                 steps=10,
+#             )
+#             del_aucs.append(del_auc)
+
+#             # Save a few overlays for inspection
+#             if saved < save_k:
+#                 save_gradcam_overlay(
+#                     x=x,
+#                     cam=cam,
+#                     out_dir=xai_dir,
+#                     epoch=epoch,
+#                     idx=seen,
+#                     true_label=y_true,
+#                     pred_label=pred_idx,
+#                 )
+#                 saved += 1
+
+#             seen += 1
+
+#         if seen >= num_samples:
+#             break
+
+#     if not del_aucs:
+#         return {"val_del_auc_mean": float("nan"), "val_del_auc_std": float("nan")}
+
+#     arr = np.asarray(del_aucs, dtype=float)
+#     return {
+#         "val_del_auc_mean": float(arr.mean()),
+#         "val_del_auc_std": float(arr.std()),
+#     }
 
 
 # def train_one_epoch_kd(
@@ -191,8 +446,6 @@
 #     logger.info(f"Saved confusion matrix PNG to {save_path}")
 
 
-
-
 # def plot_curves(
 #     history: Dict[str, List[float]],
 #     save_dir: str,
@@ -231,7 +484,7 @@
 #     logger.info(f"Saved accuracy curve to {acc_path}")
 
 #     # AUC curve (validation only)
-#     if "val_auc" in history:
+#     if "val_auc" in history and history["val_auc"]:
 #         plt.figure()
 #         plt.plot(epochs, history["val_auc"], label="Val AUC (macro)")
 #         plt.xlabel("Epoch")
@@ -243,6 +496,20 @@
 #         plt.savefig(auc_path, bbox_inches="tight")
 #         plt.close()
 #         logger.info(f"Saved AUC curve to {auc_path}")
+
+#     # Deletion AUC (Grad-CAM++) curve if available
+#     if "val_del_auc_mean" in history and history["val_del_auc_mean"]:
+#         plt.figure()
+#         plt.plot(epochs, history["val_del_auc_mean"], label="Val Deletion AUC (Grad-CAM++)")
+#         plt.xlabel("Epoch")
+#         plt.ylabel("Deletion AUC")
+#         plt.title(f"Validation Deletion AUC ({run_name})")
+#         plt.legend()
+#         plt.grid(True, linestyle="--", alpha=0.4)
+#         del_auc_path = os.path.join(save_dir, f"{run_name}_deletion_auc_curve.png")
+#         plt.savefig(del_auc_path, bbox_inches="tight")
+#         plt.close()
+#         logger.info(f"Saved Deletion AUC curve to {del_auc_path}")
 
 
 # def train_kd(
@@ -261,7 +528,7 @@
 #     num_classes: int,
 # ):
 #     """
-#     Full KD training loop with metrics, curves, confusion matrix, and AUC.
+#     Full KD training loop with metrics, curves, confusion matrix, AUC, and Grad-CAM++ XAI.
 #     Returns:
 #         history dict, best_model_path, confusion_matrix (for best epoch)
 #     """
@@ -275,11 +542,16 @@
 #         "train_acc": [],
 #         "val_acc": [],
 #         "val_auc": [],
+#         "val_del_auc_mean": [],
+#         "val_del_auc_std": [],
 #     }
 
 #     best_val_loss = float("inf")
 #     best_model_path = None
 #     best_cm = None
+
+#     # Prepare Grad-CAM++ target layer for the student
+#     target_layer = find_last_conv_layer(student_model)
 
 #     for epoch in range(1, num_epochs + 1):
 #         train_loss, train_acc = train_one_epoch_kd(
@@ -324,6 +596,26 @@
 #         )
 #         logger.info(f"Validation Confusion Matrix (epoch {epoch}):\n{cm}")
 
+#         # XAI probe: Grad-CAM++ + Deletion AUC on validation subset
+#         metrics_dir = os.path.join(save_dir, "metrics")
+#         xai_metrics = run_xai_probe_gradcam_pp(
+#             model=student_model,
+#             val_loader=val_loader,
+#             device=device,
+#             target_layer=target_layer,
+#             num_classes=num_classes,
+#             save_dir=metrics_dir,
+#             epoch=epoch,
+#             num_samples=16,  # how many val images to probe
+#             save_k=4,        # how many Grad-CAM++ overlays to save
+#         )
+#         history["val_del_auc_mean"].append(xai_metrics["val_del_auc_mean"])
+#         history["val_del_auc_std"].append(xai_metrics["val_del_auc_std"])
+#         logger.info(
+#             f"XAI (Grad-CAM++) - Deletion AUC mean: {xai_metrics['val_del_auc_mean']:.4f}, "
+#             f"std: {xai_metrics['val_del_auc_std']:.4f}"
+#         )
+
 #         # Scheduler (ReduceLROnPlateau expects a metric to minimize, here val_loss)
 #         if scheduler is not None:
 #             scheduler.step(val_loss)
@@ -336,22 +628,22 @@
 #             best_cm = cm
 #             logger.info(f"*** New best student model saved to {best_model_path} ***")
 
-#         # After all epochs, plot curves and save confusion matrix
+#     # After all epochs, plot curves and save confusion matrix
 #     metrics_dir = os.path.join(save_dir, "metrics")
 #     _ensure_dir(metrics_dir)
 #     plot_curves(history, metrics_dir, run_name)
 
 #     if best_cm is not None:
-#         # Save raw confusion matrix as text
+#         # 1) save raw confusion matrix as text
 #         cm_txt_path = os.path.join(metrics_dir, f"{run_name}_confusion_matrix.txt")
 #         with open(cm_txt_path, "w") as f:
 #             f.write(str(best_cm))
 #         logger.info(f"Saved best confusion matrix to {cm_txt_path}")
 
-#         # Save normalized confusion matrix as PNG heatmap
+#         # 2) save normalized confusion matrix as PNG (white→green)
+#         # use numeric labels 0..num_classes-1; replace with real names if you want
 #         class_names = ["Glioma_tumor", "Healthy", "Meningioma_tumor", "Pituitary_tumor"]
 #         cm_png_path = os.path.join(metrics_dir, f"{run_name}_confusion_matrix.png")
-
 #         plot_confusion_matrix(
 #             best_cm,
 #             class_names=class_names,
@@ -359,13 +651,14 @@
 #             normalize=True,
 #             title=f"Confusion Matrix ({run_name})",
 #         )
-#     return history, best_model_path, best_cm
 
+#     return history, best_model_path, best_cm
 
 
 import os
 import logging
 import math
+import json  # NEW: Import the json library
 from typing import Dict, Tuple, List
 
 import numpy as np
@@ -918,6 +1211,12 @@ def train_kd(
     # Prepare Grad-CAM++ target layer for the student
     target_layer = find_last_conv_layer(student_model)
 
+    # MOVED: Define metrics directory and JSON path *before* the loop
+    metrics_dir = os.path.join(save_dir, "metrics")
+    _ensure_dir(metrics_dir)
+    # NEW: Define the path for the JSON log
+    metrics_json_path = os.path.join(metrics_dir, f"{run_name}_metrics_history.json")
+
     for epoch in range(1, num_epochs + 1):
         train_loss, train_acc = train_one_epoch_kd(
             student_model,
@@ -962,14 +1261,14 @@ def train_kd(
         logger.info(f"Validation Confusion Matrix (epoch {epoch}):\n{cm}")
 
         # XAI probe: Grad-CAM++ + Deletion AUC on validation subset
-        metrics_dir = os.path.join(save_dir, "metrics")
+        # Note: metrics_dir is already defined above the loop
         xai_metrics = run_xai_probe_gradcam_pp(
             model=student_model,
             val_loader=val_loader,
             device=device,
             target_layer=target_layer,
             num_classes=num_classes,
-            save_dir=metrics_dir,
+            save_dir=metrics_dir, # Use pre-defined metrics_dir
             epoch=epoch,
             num_samples=16,  # how many val images to probe
             save_k=4,        # how many Grad-CAM++ overlays to save
@@ -980,6 +1279,14 @@ def train_kd(
             f"XAI (Grad-CAM++) - Deletion AUC mean: {xai_metrics['val_del_auc_mean']:.4f}, "
             f"std: {xai_metrics['val_del_auc_std']:.4f}"
         )
+
+        # NEW: Save metrics to JSON file after each epoch
+        try:
+            with open(metrics_json_path, "w") as f:
+                json.dump(history, f, indent=4)
+            logger.info(f"Metrics history saved to {metrics_json_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save metrics JSON on epoch {epoch}: {e}")
 
         # Scheduler (ReduceLROnPlateau expects a metric to minimize, here val_loss)
         if scheduler is not None:
@@ -994,8 +1301,7 @@ def train_kd(
             logger.info(f"*** New best student model saved to {best_model_path} ***")
 
     # After all epochs, plot curves and save confusion matrix
-    metrics_dir = os.path.join(save_dir, "metrics")
-    _ensure_dir(metrics_dir)
+    # metrics_dir is already defined and created
     plot_curves(history, metrics_dir, run_name)
 
     if best_cm is not None:
@@ -1006,7 +1312,6 @@ def train_kd(
         logger.info(f"Saved best confusion matrix to {cm_txt_path}")
 
         # 2) save normalized confusion matrix as PNG (white→green)
-        # use numeric labels 0..num_classes-1; replace with real names if you want
         class_names = ["Glioma_tumor", "Healthy", "Meningioma_tumor", "Pituitary_tumor"]
         cm_png_path = os.path.join(metrics_dir, f"{run_name}_confusion_matrix.png")
         plot_confusion_matrix(
